@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QButtonGroup, QHBoxLayout, QLabel, QLineEdit, QPus
 
 from ..bosses.base import fmt_time
 from .controller import ReplayController
+from .theme import TEXT_DIM
 
 
 class PlaybackBar(QWidget):
@@ -158,7 +159,12 @@ class GhostSpeedBar(QWidget):
         self.face_edit = self._number_box(48, face_title.toolTip(), self._wheel_face)
         lay.addWidget(self.face_edit)
         lay.addWidget(QLabel("°"))
-        lay.addStretch(1)
+        lay.addSpacing(16)
+        note = QLabel("日志不记录魂相关数据。图中的魂由这两个参数推算而来，不一定真实，仅供参考。")
+        note.setStyleSheet(f"color: {TEXT_DIM}; font-size: 8pt;")
+        note.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        note.setWordWrap(True)
+        lay.addWidget(note, 1)
 
         saved = self._setting("ghost_speed", ctl.ghost_speed)
         face = self._setting("ghost_face_deg", ctl.ghost_face_deg)

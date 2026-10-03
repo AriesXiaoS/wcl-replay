@@ -9,6 +9,7 @@ from ..base import (
     Analysis,
     Bar,
     BossModule,
+    FrameAura,
     HudLine,
     Line,
     LogEntry,
@@ -26,11 +27,44 @@ from .p1 import P1Model
 from .p2 import P2Model
 from .wcl import slices as wcl_slices
 
+# Icons are the retail spell icons. 被魂撞 is Dreadmarch: the march itself, and the same
+# aura again after a ghost reaches its target.
+FRAME_AURAS = (
+    FrameAura(
+        "entombed",
+        "墓缚",
+        ((C.ENTOMBED, "ability_demonhunter_shatteredsouls"),),
+        "点名大圈。",
+    ),
+    FrameAura(
+        "fixate",
+        "被魂盯",
+        ((C.FIXATE, "ability_fixated_state_purple"),),
+        "令人不安的凝视：魂正在看这个玩家。",
+    ),
+    FrameAura(
+        "caught",
+        "被魂撞",
+        ((C.POSSESSED, "spell_nzinsanity_fearofdeath"),),
+        "恐惧行军。被附身走向台边，以及魂追上之后，身上都是这个效果。",
+    ),
+    FrameAura(
+        "carry",
+        "搬球",
+        (
+            (C.GREEN_CARRY, "ability_creature_disease_02"),
+            (C.PURPLE_CARRY, "ability_creature_disease_03"),
+        ),
+        "手上的烈性毒液（绿）或诱变毒液（紫）。",
+    ),
+)
+
 
 class CoiledAltarAnalysis(Analysis):
     title = "盘卷祭坛"
     boss_npc_ids = (C.NPC_ZULJAN, C.NPC_MALACRASS)
     hidden_npc_ids = frozenset({C.NPC_GREEN, C.NPC_PURPLE, C.NPC_AXE})
+    frame_auras = FRAME_AURAS
 
     def __init__(self, data: FightData, tracks: Tracks):
         super().__init__(data, tracks)

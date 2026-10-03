@@ -56,7 +56,16 @@ QSlider::groove:horizontal {{ height: 4px; background: {BORDER}; border-radius: 
 QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 2px; }}
 QSlider::handle:horizontal {{ background: {ACCENT}; width: 14px; height: 14px; margin: -6px 0; border-radius: 7px; }}
 QLabel#title {{ font-size: 10pt; color: {TEXT_DIM}; padding: 2px 6px; }}
+QLabel#aboutName {{ font-size: 13pt; }}
+QLabel#aboutHeading {{ color: {TEXT_DIM}; }}
 QScrollBar:vertical {{ background: {PANEL}; width: 10px; }}
 QScrollBar::handle:vertical {{ background: {BORDER}; border-radius: 4px; min-height: 30px; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
+QFrame#auraPopup {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 8px; }}
+QFrame#auraPopup QCheckBox {{ background: transparent; spacing: 8px; padding: 2px 4px; }}
+QFrame#auraPopup QLabel {{ background: transparent; color: {TEXT_DIM}; }}
+QFrame#auraPopup QCheckBox::indicator {{
+    width: 14px; height: 14px; border: 1px solid {TEXT_DIM}; border-radius: 3px; background: {BG};
+}}
+QFrame#auraPopup QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
 """

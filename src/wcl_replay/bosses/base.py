@@ -324,6 +324,20 @@ def fmt_secs(ms: float) -> str:
     return f"{max(0.0, ms) / 1000:.0f} s" if ms >= 10000 else f"{max(0.0, ms) / 1000:.1f} s"
 
 
+@dataclass(slots=True, frozen=True)
+class FrameAura:
+    """One debuff the raid frames can draw. Nothing is shown until the user selects its key.
+
+    ``spells`` is ``(spell id, icon stem)`` in the order icons are drawn, left to right.
+    The stem is a PNG in ``assets/auras`` without the extension.
+    """
+
+    key: str
+    label: str
+    spells: tuple[tuple[int, str], ...]
+    tip: str = ""
+
+
 # ---------------------------------------------------------------------------- analysis / module
 
 
@@ -335,6 +349,8 @@ class Analysis:
     hidden_npc_ids: frozenset[int] = frozenset()
     # Extra occlusion cards that are not actors, such as floor orbs: (group id, label).
     stack_extras: tuple[tuple[str, str], ...] = ()
+    # Debuffs the raid frames offer in the filter. Empty until a boss lists them.
+    frame_auras: ClassVar[tuple[FrameAura, ...]] = ()
 
     def __init__(self, data: FightData, tracks: Tracks):
         self.data = data
@@ -358,6 +374,7 @@ class Analysis:
             for e in data.events
             if e.type == "UNIT_DIED" and e.dst in data.actors and data.actors[e.dst].is_player
         )
+        self._index_frame_auras()
 
     # -- defaults -----------------------------------------------------------------------------
 
@@ -425,6 +442,27 @@ class Analysis:
             return True
         x0, x1, y0, y1 = box
         return x0 <= x <= x1 and y0 <= y <= y1
+
+    def _index_frame_auras(self) -> None:
+        players = {actor.id for actor in self.data.players()}
+        indexed: dict[str, Intervals] = {}
+        for aura in self.frame_auras:
+            spell_ids = {spell_id for spell_id, _icon in aura.spells}
+            indexed[aura.key] = aura_intervals(self.data, spell_ids, dst_filter=players.__contains__)
+        self._frame_iv = indexed
+
+    def active_frame_auras(self, actor_id: int, t: float) -> tuple[tuple[str, str], ...]:
+        """``(key, icon stem)`` for debuffs in ``frame_auras`` that are up on this player."""
+        out: list[tuple[str, str]] = []
+        for aura in self.frame_auras:
+            intervals = self._frame_iv.get(aura.key)
+            if intervals is None:
+                continue
+            up = {iv.payload for iv in intervals.active(t) if iv.actor == actor_id}
+            for spell_id, icon in aura.spells:
+                if spell_id in up:
+                    out.append((aura.key, icon))
+        return tuple(out)
 
     def units_at(self, t: float) -> list[int]:
         """Non-player units to draw at time t."""

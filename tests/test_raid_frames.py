@@ -11,15 +11,24 @@ from types import SimpleNamespace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")
 
-from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtCore import QPoint, QPointF, QSettings, Qt
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication, QSplitter
 
+from wcl_replay.bosses.base import FrameAura
 from wcl_replay.core.models import Actor, ActorKind
 from wcl_replay.ui.controller import ReplayController
 from wcl_replay.ui.main_window import MainWindow
 from wcl_replay.ui.map_view import MapView
-from wcl_replay.ui.raid_frames import _RaidGrid, frame_rect, layout_columns, order_players, unit_hp
+from wcl_replay.ui.raid_frames import (
+    AuraFilter,
+    _RaidGrid,
+    aura_metrics,
+    frame_rect,
+    layout_columns,
+    order_players,
+    unit_hp,
+)
 
 
 def _click(widget, x: float, y: float) -> None:
@@ -136,4 +145,52 @@ def test_raid_frames_sit_at_the_top_of_the_right_column():
     assert isinstance(splitter, QSplitter)
     assert splitter.orientation() == Qt.Orientation.Vertical
     assert splitter.widget(0) is window.raid_frames
+    assert splitter.widget(1) is window.aura_filter
+    assert window.aura_filter.summary.text() == "不显示"
     window.close()
+
+
+def test_debuff_icons_default_to_about_half_the_frame_and_shrink_to_one_row():
+    _pad, _gap, one = aura_metrics(100, 50, 1)
+    assert 20 <= one <= 25
+    pad, gap, many = aura_metrics(100, 50, 8)
+    assert many < one
+    assert 8 * many + 7 * gap <= 100 - 2 * pad + 1e-6
+
+
+def _aura_session(encounter_id: int = 3429):
+    auras = (
+        FrameAura("entombed", "墓缚", ((1, "ability_demonhunter_shatteredsouls"),), "点名"),
+        FrameAura("fixate", "被魂盯", ((2, "ability_fixated_state_purple"),), "凝视"),
+    )
+    return SimpleNamespace(
+        analysis=SimpleNamespace(frame_auras=auras),
+        data=SimpleNamespace(fight=SimpleNamespace(encounter_id=encounter_id)),
+    )
+
+
+def test_debuff_filter_starts_empty_and_remembers_a_multi_selection(tmp_path):
+    QApplication.instance() or QApplication([])
+    settings = QSettings(str(tmp_path / "ui.ini"), QSettings.Format.IniFormat)
+    ctl = ReplayController()
+    filt = AuraFilter(ctl, settings)
+    assert filt.selected_keys() == set()
+    assert filt.summary.text() == "不显示"
+
+    ctl.session = _aura_session()
+    ctl.sessionChanged.emit()
+    assert [box.text() for box in filt._boxes] == ["墓缚", "被魂盯"]
+    assert filt.selected_keys() == set()
+
+    filt._boxes[0].setChecked(True)
+    filt._boxes[1].setChecked(True)
+    assert filt.selected_keys() == {"entombed", "fixate"}
+    assert filt.summary.text() == "墓缚、被魂盯"
+
+    again = AuraFilter(ctl, settings)
+    assert again.selected_keys() == {"entombed", "fixate"}
+
+    ctl.session = _aura_session(encounter_id=1)
+    ctl.sessionChanged.emit()
+    assert filt.selected_keys() == set()
+    assert filt.summary.text() == "不显示"

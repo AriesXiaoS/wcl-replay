@@ -37,7 +37,7 @@ from .log_panel import LogPanel, PullBoard, short_error
 from .map_view import MapView
 from .panels import EventLogPanel, StatusPanel
 from .playback import GhostSpeedBar, PlaybackBar
-from .raid_frames import RaidFrames
+from .raid_frames import AuraFilter, RaidFrames
 from .settings_dialog import SettingsDialog, cached_limit
 from .stack_panel import UnitStackPanel
 from .timeline import TimelineWidget
@@ -94,15 +94,19 @@ class MainWindow(QMainWindow):
         lv.addWidget(GhostSpeedBar(self.ctl, self.settings))
         lv.addWidget(TimelineWidget(self.ctl))
 
-        self.raid_frames = RaidFrames(self.ctl)
+        self.aura_filter = AuraFilter(self.ctl, self.settings)
+        self.raid_frames = RaidFrames(self.ctl, self.aura_filter.selected_keys)
+        self.aura_filter.changed.connect(self.raid_frames.grid.update)
         middle = QSplitter(Qt.Orientation.Vertical)
         middle.addWidget(self.raid_frames)
+        middle.addWidget(self.aura_filter)
         middle.addWidget(StatusPanel(self.ctl))
         middle.addWidget(EventLogPanel(self.ctl))
         middle.setStretchFactor(0, 0)
-        middle.setStretchFactor(1, 1)
-        middle.setStretchFactor(2, 2)
-        middle.setSizes([228, 280, 430])
+        middle.setStretchFactor(1, 0)
+        middle.setStretchFactor(2, 1)
+        middle.setStretchFactor(3, 2)
+        middle.setSizes([300, 42, 240, 400])
 
         self._source = QStackedWidget()
         self._source.addWidget(self.log_panel)

@@ -11,11 +11,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")
 
 from PySide6.QtCore import QSettings
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
 from wcl_replay import __version__
 from wcl_replay.ui.main_window import MainWindow
-from wcl_replay.ui.settings_dialog import SettingsDialog, cached_limit
+from wcl_replay.ui.settings_dialog import PROJECT_URL, SettingsDialog, cached_limit
 
 
 def test_the_keep_limit_defaults_to_ten_and_can_be_saved(tmp_path):
@@ -28,6 +28,19 @@ def test_the_keep_limit_defaults_to_ten_and_can_be_saved(tmp_path):
     dialog.keep.setValue(4)
     dialog._save()
     assert cached_limit(settings) == 4
+
+
+def test_about_page_names_the_author_license_and_update_url(tmp_path):
+    QApplication.instance() or QApplication([])
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    dialog = SettingsDialog(settings)
+    assert dialog.categories.item(1).text() == "关于"
+    dialog.categories.setCurrentRow(1)
+    text = "\n".join(label.text() for label in dialog.pages.currentWidget().findChildren(QLabel))
+    assert "伐竹取道 (AriesXiao)" in text
+    assert "PolyForm Noncommercial License 1.0.0" in text
+    assert "禁止出售、嵌入收费产品，或用于收费服务" in text
+    assert PROJECT_URL in text
 
 
 def test_settings_button_sits_beside_the_source_switch():
