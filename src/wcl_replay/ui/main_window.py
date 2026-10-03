@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import __version__
 from ..bosses.base import fmt_time
 from ..sources.local_log.index import DIFFICULTY_LABELS
 from ..sources.wcl_api.fetch import report_host
@@ -52,7 +53,7 @@ DEFAULT_LOG_DIRS = (
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("WCL Replay · 战斗复盘")
+        self.setWindowTitle(f"WCL Replay {__version__} · 战斗复盘")
         self.resize(1680, 980)
         self.statusBar().hide()
         self.settings = QSettings("wcl_replay", "wcl_replay")

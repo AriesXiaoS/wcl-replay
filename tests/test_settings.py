@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
+from wcl_replay import __version__
 from wcl_replay.ui.main_window import MainWindow
 from wcl_replay.ui.settings_dialog import SettingsDialog, cached_limit
 
@@ -34,4 +35,5 @@ def test_settings_button_sits_beside_the_source_switch():
     window = MainWindow()
     assert window.settings_btn.text() == "设置"
     assert window.settings_btn.parentWidget() is window._local_mode.parentWidget()
+    assert window.windowTitle() == f"WCL Replay {__version__} · 战斗复盘"
     window.close()
