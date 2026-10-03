@@ -205,7 +205,7 @@ def test_main_window_clear_button_forgets_a_computed_pull():
     assert win.board.activate(0) == "start"
 
 
-def test_starting_past_the_cap_releases_the_bottom_finished_pull():
+def test_starting_past_the_cap_releases_the_earliest_calculation():
     app = QApplication.instance() or QApplication([])
     ctl = ReplayController()
     panel = LogPanel()
@@ -215,21 +215,41 @@ def test_starting_past_the_cap_releases_the_bottom_finished_pull():
     board.show_entries(gen, path, [_entry(0, 1, "最早"), _entry(200, 2, "中间"), _entry(400, 3, "最新")])
     assert "最新" in panel.rows[0].text.text()
     assert "最早" in panel.rows[2].text.text()
-    top, mid = _session(), _session()
-    board.loads.cache[board.keys[0]] = top
-    board.loads.cache[board.keys[1]] = mid
-    panel.mark_done(0)
-    panel.mark_done(1)
-    assert board.activate(0) == "show"
-    assert ctl.session is top
-
+    newest, oldest = board.keys[0], board.keys[2]
+    first, second = _session(), _session()
     assert board.activate(2) == "start"
-    assert board.keys[1] not in board.loads.cache
-    assert board.keys[0] in board.loads.cache
-    assert panel.rows[1].mark.text() == ""
+    assert board.finish(gen, path, oldest, first) is True
+    assert board.activate(0) == "start"
+    assert board.finish(gen, path, newest, second) is True
+    assert board.activate(0) == "show"
+    assert ctl.session is second
+
+    assert board.activate(1) == "start"
+    assert oldest not in board.loads.cache
+    assert newest in board.loads.cache
+    assert panel.rows[2].mark.text() == ""
     assert panel.rows[0].mark.text() == "✓"
-    assert ctl.session is top
+    assert ctl.session is second
+    assert board.loads.order[0] == newest
     app.processEvents()
+
+
+def test_eviction_follows_click_order_when_results_finish_out_of_order():
+    _app, _ctl, panel, board = _board()
+    board._limit = lambda: 2
+    path = r"D:\Logs\WoWCombatLog.txt"
+    gen = board.prepare(path)
+    board.show_entries(gen, path, [_entry(0, 1, "一"), _entry(200, 2, "二"), _entry(400, 3, "三")])
+    for index in (0, 1, 2):
+        assert board.activate(index) == "start"
+    assert board.finish(gen, path, board.keys[1], _session()) is False
+    assert board.finish(gen, path, board.keys[0], _session()) is False
+    assert board.finish(gen, path, board.keys[2], _session()) is True
+    assert board.keys[0] not in board.loads.cache
+    assert board.keys[1] in board.loads.cache
+    assert board.keys[2] in board.loads.cache
+    assert panel.rows[0].mark.text() == ""
+    assert panel.rows[1].mark.text() == "✓"
 
 
 def test_releasing_a_pull_keeps_the_row_and_drops_memory():

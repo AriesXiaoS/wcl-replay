@@ -29,9 +29,9 @@ PROJECT_URL = "https://github.com/AriesXiaoS/wcl-replay"
 def cached_limit(settings: QSettings) -> int:
     """How many finished local-log pulls stay in memory. WCL queries are not capped."""
     try:
-        value = int(settings.value(MAX_CACHED_FIGHTS, 10))
+        value = int(settings.value(MAX_CACHED_FIGHTS, 3))
     except (TypeError, ValueError):
-        return 10
+        return 3
     return max(1, min(50, value))
 
 
@@ -67,7 +67,7 @@ class SettingsDialog(QDialog):
 
     def _general_page(self) -> QWidget:
         hint = QLabel(
-            "只统计本地日志里已经算完的轮次。达到上限后再计算新的一场，会释放列表最下面那场已算完的内存。"
+            "只统计本地日志里已经算完的轮次。达到上限后再计算新的一场，会释放最早计算的那场已算完的内存。"
             "每行的 × 同样只释放这一场的内存，列表项还在。"
             "WCL 列表不自动清理，× 会删掉整条记录，也可以用底部的清除缓存。"
         )

@@ -29,7 +29,7 @@ class CredentialsDialog(QDialog):
 
         info = QLabel(
             '在 <a href="https://www.warcraftlogs.com/api/clients/">warcraftlogs.com/api/clients</a> '
-            "新建一个 API Client。Redirect URL 填 http://localhost 即可，"
+            "新建一个 API Client。<br>Redirect URL 填 http://localhost 即可，"
             "然后把 Client ID 和 Client Secret 填到这里。"
         )
         info.setOpenExternalLinks(True)

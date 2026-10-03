@@ -18,13 +18,13 @@ from wcl_replay.ui.main_window import MainWindow
 from wcl_replay.ui.settings_dialog import PROJECT_URL, SettingsDialog, cached_limit
 
 
-def test_the_keep_limit_defaults_to_ten_and_can_be_saved(tmp_path):
+def test_the_keep_limit_defaults_to_three_and_can_be_saved(tmp_path):
     QApplication.instance() or QApplication([])
     settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
-    assert cached_limit(settings) == 10
+    assert cached_limit(settings) == 3
     dialog = SettingsDialog(settings)
     assert dialog.categories.item(0).text() == "通用设置"
-    assert dialog.keep.value() == 10
+    assert dialog.keep.value() == 3
     dialog.keep.setValue(4)
     dialog._save()
     assert cached_limit(settings) == 4

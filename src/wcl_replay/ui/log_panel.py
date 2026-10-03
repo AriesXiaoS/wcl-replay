@@ -47,17 +47,23 @@ def short_error(tb: str) -> str:
 
 
 class PullLoads:
-    """Which pull is selected, which are cached, and which are still computing."""
+    """Which pull is selected, which are cached, and which are still computing.
+
+    ``order`` is the sequence of calculations, oldest first. Viewing a cached pull does not
+    move it. The board drops from the front of this list, not from the bottom of the log.
+    """
 
     def __init__(self) -> None:
         self.selected: tuple | None = None
         self.cache: dict[tuple, object] = {}
         self.running: set[tuple] = set()
+        self.order: list[tuple] = []
 
     def reset(self) -> None:
         self.selected = None
         self.cache.clear()
         self.running.clear()
+        self.order.clear()
 
     def click(self, key: tuple) -> str:
         """``show`` if cached, ``wait`` if already running, ``start`` if this click begins work."""
@@ -67,16 +73,30 @@ class PullLoads:
         if key in self.running:
             return "wait"
         self.running.add(key)
+        self.remember(key)
         return "start"
 
     def complete(self, key: tuple, session: object) -> bool:
         """Store the result. True only when this pull is still the one the user has selected."""
         self.running.discard(key)
         self.cache[key] = session
+        self.remember(key)
         return self.selected == key
 
     def abandon(self, key: tuple) -> None:
         self.running.discard(key)
+        self.forget_order(key)
+
+    def remember(self, key: tuple) -> None:
+        """Record a calculation the first time it starts. A later view does not move it."""
+        if key not in self.order:
+            self.order.append(key)
+
+    def forget_order(self, key: tuple) -> None:
+        try:
+            self.order.remove(key)
+        except ValueError:
+            pass
 
 
 class _PullRow(QFrame):
@@ -350,7 +370,7 @@ class PullBoard:
     def __init__(self, ctl: ReplayController, panel: LogPanel, limit: Callable[[], int] | None = None):
         self.ctl = ctl
         self.panel = panel
-        self._limit = limit or (lambda: 10)
+        self._limit = limit or (lambda: 3)
         self.loads = PullLoads()
         self.panel.releaseRequested.connect(self.release)
         self.gen = 0
@@ -446,6 +466,7 @@ class PullBoard:
             return
         key = self.keys[index]
         self.loads.running.discard(key)
+        self.loads.forget_order(key)
         session = self.loads.cache.pop(key, None)
         if session is not None and self.ctl.session is session:
             self.ctl.clear_session()
@@ -455,7 +476,7 @@ class PullBoard:
         self.panel.rows[index].release_result()
 
     def trim_to_limit(self, keep: tuple | None = None) -> None:
-        """Forget finished pulls past the cap, starting from the bottom of the list."""
+        """Forget finished pulls past the cap, oldest calculation first."""
         cap = self._cap()
         while len(self.loads.cache) > cap:
             if not self._evict_one(keep):
@@ -472,29 +493,31 @@ class PullBoard:
         try:
             return max(1, int(self._limit()))
         except (TypeError, ValueError):
-            return 10
+            return 3
 
     def _evict_one(self, keep: tuple | None = None) -> bool:
-        for index in range(len(self.keys) - 1, -1, -1):
-            key = self.keys[index]
+        for key in list(self.loads.order):
             if key == keep or key in self.loads.running or key not in self.loads.cache:
                 continue
-            self._forget(key, index)
+            self._forget(key, self._index.get(key))
             return True
         return False
 
-    def _forget(self, key: tuple, index: int) -> None:
+    def _forget(self, key: tuple, index: int | None) -> None:
         session = self.loads.cache.pop(key, None)
+        self.loads.forget_order(key)
         if session is not None and self.ctl.session is session:
             self.ctl.clear_session()
         if self.loads.selected == key and key not in self.loads.running:
             self.loads.selected = None
             self.panel.set_selected(None)
-        self.panel.clear_done(index)
+        if index is not None:
+            self.panel.clear_done(index)
 
     def clear_cache(self) -> None:
         """Drop finished results. A pull that is still computing is left alone."""
         self.loads.cache.clear()
+        self.loads.order = [key for key in self.loads.order if key in self.loads.running]
         if self.loads.selected not in self.loads.running:
             self.loads.selected = None
             self.panel.set_selected(None)
@@ -520,6 +543,7 @@ class PullBoard:
         for key in [key for key in self.loads.cache if gone(key)]:
             del self.loads.cache[key]
         self.loads.running.difference_update(key for key in self.loads.running if gone(key))
+        self.loads.order = [key for key in self.loads.order if not gone(key)]
 
     def show_selected(self) -> None:
         """Show this card's cached pull again after the source switch comes back to local logs."""
