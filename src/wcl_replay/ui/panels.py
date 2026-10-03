@@ -1,0 +1,150 @@
+# Copyright (c) 2026 伐竹取道 (AriesXiao)
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+"""Right-hand panels: RIGHT NOW (status at the current time) and WHAT HAPPENED (clickable event log)."""
+
+from __future__ import annotations
+
+import bisect
+import html
+
+from PySide6.QtCore import QTimer, QUrl
+from PySide6.QtWidgets import QTextBrowser, QWidget
+
+from ..bosses.base import Cell, Seg, fmt_time
+from . import theme
+from .controller import ReplayController
+
+
+def _mix(color: str, other: str, f: float) -> str:
+    def rgb(c: str) -> tuple[int, int, int]:
+        c = c.lstrip("#")
+        if len(c) == 3:
+            c = "".join(ch * 2 for ch in c)
+        if len(c) < 6:
+            return (154, 160, 166)
+        return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+
+    a, b = rgb(color), rgb(other)
+    r, g, bch = (round(x * (1 - f) + y * f) for x, y in zip(a, b, strict=True))
+    return f"#{r:02x}{g:02x}{bch:02x}"
+
+
+def seg_html(seg: Seg) -> str:
+    text = html.escape(seg.text).replace("\n", "<br>")
+    color = seg.color or theme.TEXT
+    if seg.badge:
+        return (
+            f'<span style="background-color:{_mix(color, theme.PANEL, 0.72)}; color:{color};">'
+            f"&nbsp;{text}&nbsp;</span>"
+        )
+    weight = "bold" if seg.bold else "normal"
+    return f'<span style="color:{color}; font-weight:{weight};">{text}</span>'
+
+
+def cell_html(c: Cell) -> str:
+    if c.bar is not None:
+        w = max(1, min(100, int(c.bar * 100)))
+        color = c.color or theme.ACCENT
+        return (
+            f'<td width="60" valign="middle"><table width="100%" cellspacing="0" cellpadding="0" height="5">'
+            f'<tr><td width="{w}%" bgcolor="{color}" height="5"></td>'
+            f'<td width="{100 - w}%" bgcolor="{theme.PANEL_2}" height="5"></td></tr></table></td>'
+        )
+    return f'<td align="{c.align}">{seg_html(Seg(c.text, c.color, c.badge, c.bold))}</td>'
+
+
+class StatusPanel(QTextBrowser):
+    def __init__(self, ctl: ReplayController, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.ctl = ctl
+        self.setOpenLinks(False)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(120)
+        self._timer.timeout.connect(self._render)
+        ctl.timeChanged.connect(lambda _t: self._timer.start() if not self._timer.isActive() else None)
+        ctl.sessionChanged.connect(self._render)
+        ctl.layersChanged.connect(self._render)
+
+    def _render(self) -> None:
+        s = self.ctl.session
+        parts = [f'<p style="color:{theme.TEXT_DIM}; font-weight:bold;">RIGHT NOW</p>']
+        if s is None:
+            self.setHtml("".join(parts))
+            return
+        for sec in s.analysis.status_at(self.ctl.t):
+            parts.append(
+                f'<p style="color:{sec.color}; font-weight:bold; margin-top:8px;">{html.escape(sec.title)}</p>'
+            )
+            if sec.rows:
+                parts.append('<table width="100%" cellspacing="0" cellpadding="2">')
+                for row in sec.rows:
+                    parts.append("<tr>" + "".join(cell_html(c) for c in row) + "</tr>")
+                parts.append("</table>")
+            if sec.note:
+                parts.append(f'<p style="color:{theme.TEXT_DIM};">{html.escape(sec.note)}</p>')
+        sb = self.verticalScrollBar().value()
+        self.setHtml("".join(parts))
+        self.verticalScrollBar().setValue(sb)
+
+
+class EventLogPanel(QTextBrowser):
+    HIGHLIGHT_MS = 2500
+
+    def __init__(self, ctl: ReplayController, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.ctl = ctl
+        self.setOpenLinks(False)
+        self.anchorClicked.connect(self._on_anchor)
+        self.document().setDefaultStyleSheet("a { text-decoration: none; }")
+        self._key: tuple | None = None
+        self._times: list[int] = []
+        ctl.sessionChanged.connect(self._on_session)
+        ctl.timeChanged.connect(lambda _t: self._render())
+        ctl.layersChanged.connect(lambda: self._render(force=True))
+
+    def _on_session(self) -> None:
+        s = self.ctl.session
+        self._times = [e.t for e in s.analysis.log] if s else []
+        self._render(force=True)
+
+    def _on_anchor(self, url: QUrl) -> None:
+        text = url.toString()
+        if text.startswith("t:"):
+            self.ctl.seek(int(text[2:]))
+
+    def _render(self, force: bool = False) -> None:
+        s = self.ctl.session
+        if s is None:
+            self.setHtml("")
+            return
+        t = self.ctl.t
+        cur = bisect.bisect_right(self._times, t)
+        lo = bisect.bisect_left(self._times, t - self.HIGHLIGHT_MS)
+        key = (lo, cur)
+        if key == self._key and not force:
+            return
+        self._key = key
+        parts = [
+            f'<p style="color:{theme.TEXT_DIM}; font-weight:bold;">WHAT HAPPENED · 点击跳转</p>',
+            '<table width="100%" cellspacing="0" cellpadding="3">',
+        ]
+        anchor_at = max(0, cur - 3)
+        for i, e in enumerate(s.analysis.log):
+            if e.lane and not self.ctl.layer_on(e.lane):
+                continue
+            bg = f' bgcolor="{theme.PANEL_2}"' if lo <= i < cur else ""
+            name = '<a name="cur"></a>' if i == anchor_at else ""
+            body = "".join(seg_html(sg) for sg in e.segments)
+            if e.sub:
+                body += "<br>" + "".join(seg_html(sg) for sg in e.sub)
+            future = i >= cur
+            tcol = theme.TEXT_DIM if not future else _mix(theme.TEXT_DIM, theme.PANEL, 0.4)
+            parts.append(
+                f'<tr{bg}><td width="38" valign="top">{name}<a href="t:{e.t}" style="color:{tcol};">'
+                f'{fmt_time(e.t)}</a></td><td><a href="t:{e.t}">{body}</a></td></tr>'
+            )
+        parts.append("</table>")
+        self.setHtml("".join(parts))
+        self.scrollToAnchor("cur")

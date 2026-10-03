@@ -1,0 +1,43 @@
+[project]
+name = "wcl-replay"
+version = "0.1.0"
+description = "Warcraft Logs / combat log replay and boss mechanic analysis (PySide6)"
+readme = "README.md"
+license = "PolyForm-Noncommercial-1.0.0"
+authors = [
+    { name = "伐竹取道 (AriesXiao)", email = "cqsunxiao@sjtu.edu.cn" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "numpy>=2.5.3",
+    "pyside6>=6.11.2",
+]
+
+[project.scripts]
+wcl-replay = "wcl_replay.app:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.9",
+]
+package = [
+    "nuitka>=4.2",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
