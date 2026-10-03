@@ -5,8 +5,11 @@
 
 Ghosts usually log only their spawn position, so the whole path is simulated up front: each one
 walks in a straight line toward the player it fixates, and stands still on any step where that
-player is looking at it. A later combat-log sample with different coordinates replaces the simulated
-position at that timestamp. Resonance does not move them.
+player is looking at it. Constant speed uses one rate the whole way, and after the player looks
+away it waits out the pause before the next step moves. Accel speed starts at another rate when
+that fixate begins, reaches the end rate over the accel time, then holds it, with no pause. A later
+combat-log sample with different coordinates replaces the simulated position at that timestamp.
+Resonance does not move them.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+from ...core.cancellation import check_cancelled
 from ...core.models import FightData, Sample
 from ...core.specs import class_color
 from ...core.tracks import Track, Tracks, angle_to, distance
@@ -43,7 +47,7 @@ from . import constants as C
 from .common import angle_diff, color_of, events_between, movement_times, name_seg, short, trail_points
 
 
-@dataclass(eq=False)
+@dataclass(slots=True, eq=False)
 class Ghost:
     aid: int
     spawn_t: int
@@ -67,15 +71,15 @@ class Ghost:
         return actor.short_name[:1], class_color(actor.class_name)
 
 
-@dataclass(eq=False)
+@dataclass(slots=True, eq=False)
 class FixateEnd:
     t: int
     ghost: int
     player: int
-    reason: str  # severed | resonance | died | reached
+    reason: str  # severed | resonance | died | reached | unknown
 
 
-@dataclass(eq=False)
+@dataclass(slots=True, eq=False)
 class Dreadmarch:
     cast_start: int
     t: int
@@ -83,7 +87,7 @@ class Dreadmarch:
     ghosts: list[Ghost]
 
 
-@dataclass(eq=False)
+@dataclass(slots=True, eq=False)
 class WailCast:
     src: int
     start: int
@@ -125,11 +129,12 @@ def wail_remaining_ms(start: int, t: float, base_ms: int, cursed: list[tuple[int
     return left * _cast_mult(cursed, t)
 
 
-@dataclass(eq=False)
+@dataclass(slots=True, eq=False)
 class Bomb:
     t: int  # explosion
     targets: list[int]
     cracked: int = 0
+    evidence: str = "aura_end"
 
 
 class P2Model:
@@ -151,12 +156,19 @@ class P2Model:
         self.dreadmarches = self._dreadmarches()
         self.resonances = self._resonances()
         self.soul_severs = self._soul_severs()
+        players = {a.id for a in data.players()}
+        self.possessed_iv = aura_intervals(data, C.POSSESSED, dst_filter=players.__contains__)
         self.fixate_ends = self._fixate_ends()
+        self.motion_mode = "constant"
         self.speed = C.GHOST_SPEED
+        self.pause_s = C.GHOST_PAUSE_S
         self.face_deg = C.GHOST_FACE_DEG
+        self.start_speed = C.GHOST_START_SPEED
+        self.end_speed = C.GHOST_END_SPEED
+        self.accel_s = C.GHOST_ACCEL_S
         self._log_pos = self._logged_positions()
         self._routes: dict[int, tuple[tuple[int, float, float], ...]] = {}
-        self._simulate_ghosts(self.speed, self.face_deg)
+        self._simulate_ghosts()
         self.bomb_iv = aura_intervals(data, C.GLOOMBOMB)
         self.resonance_iv = aura_intervals(data, {C.RESONANCE, C.RESONANCE_MARK})
         self.bombs = self._bombs()
@@ -167,16 +179,14 @@ class P2Model:
         self._tongues = self._tongue_windows()
         self.wails = self._wails()
         self.shield_changes = self._shields()
-        players = {a.id for a in data.players()}
-        self.possessed_iv = aura_intervals(data, C.POSSESSED, dst_filter=players.__contains__)
 
     # -- extraction ---------------------------------------------------------------------------
 
     def _ghosts(self) -> list[Ghost]:
-        fix = aura_intervals(self.data, C.FIXATE)
+        fix = aura_intervals(self.data, C.FIXATE, source_independent=True)
         out = []
         for a in self.data.actors_by_npc(C.NPC_GHOST):
-            tr = self.tracks.track(a.id)
+            tr = self.tracks.observed_track(a.id)
             if tr is None or not len(tr):
                 continue
             g = Ghost(
@@ -187,6 +197,9 @@ class P2Model:
                 self.tracks.last_seen.get(a.id, self.end_t),
             )
             g.fixates = [iv for iv in fix if iv.src == a.id]
+            # A source-less removal still closes this ghost's known fixate. It carries no actor
+            # activity for Tracks.last_seen, so the interval is additional lifetime evidence.
+            g.end_t = max(g.end_t, max((iv.end for iv in g.fixates), default=g.end_t))
             if self.tracks.death_time(a.id) is not None:
                 g.end_t = self.tracks.death_time(a.id)
             out.append(g)
@@ -274,31 +287,76 @@ class P2Model:
                     reason = "resonance"
                 elif any(abs(iv.end - dt) <= 1500 and pid == iv.actor for dt, pid in self.player_deaths):
                     reason = "died"
-                else:
+                elif any(abs(iv.end - p.start) <= 400 and p.actor == iv.actor for p in self.possessed_iv):
                     reason = "reached"
+                else:
+                    reason = "unknown"
                 out.append(FixateEnd(iv.end, g.aid, iv.actor, reason))
         out.sort(key=lambda fe: fe.t)
         return out
 
-    def set_motion(self, speed: float | None = None, face_deg: float | None = None) -> None:
+    def set_motion(
+        self,
+        speed: float | None = None,
+        face_deg: float | None = None,
+        mode: str | None = None,
+        start_speed: float | None = None,
+        end_speed: float | None = None,
+        accel_s: float | None = None,
+        pause_s: float | None = None,
+    ) -> None:
         """Rebuild every ghost path from spawn to despawn. The log has neither speed nor a facing cone."""
-        speed = self.speed if speed is None else max(0.0, float(speed))
-        face_deg = self.face_deg if face_deg is None else max(0.0, float(face_deg))
-        if (
-            speed == self.speed
-            and face_deg == self.face_deg
-            and any(self.tracks.has(g.aid) for g in self.ghosts)
-        ):
+        before = self._motion_key()
+        if speed is not None:
+            self.speed = max(0.0, float(speed))
+        if face_deg is not None:
+            self.face_deg = max(0.0, float(face_deg))
+        if mode is not None:
+            self.motion_mode = "accel" if mode == "accel" else "constant"
+        if start_speed is not None:
+            self.start_speed = max(0.0, float(start_speed))
+        if end_speed is not None:
+            self.end_speed = max(0.0, float(end_speed))
+        if accel_s is not None:
+            self.accel_s = max(0.0, float(accel_s))
+        if pause_s is not None:
+            self.pause_s = max(0.0, float(pause_s))
+        if self._motion_key() == before and any(self.tracks.has(g.aid) for g in self.ghosts):
             return
-        self.speed = speed
-        self.face_deg = face_deg
-        self._simulate_ghosts(speed, face_deg)
+        self._simulate_ghosts()
+
+    def _motion_key(self) -> tuple:
+        face = round(self.face_deg, 4)
+        if self.motion_mode != "accel":
+            return ("constant", round(self.speed, 4), round(self.pause_s, 4), face)
+        return (
+            "accel",
+            round(self.start_speed, 4),
+            round(self.end_speed, 4),
+            round(self.accel_s, 4),
+            face,
+        )
+
+    def _chase_speed(self, g: Ghost, t: float) -> float:
+        """Yards per second. Accel time runs from the start of the fixate covering ``t``."""
+        if self.motion_mode != "accel":
+            return self.speed
+        origin = g.spawn_t
+        for iv in g.fixates:
+            if iv.start <= t < iv.end:
+                origin = iv.start
+                break
+        span = self.accel_s * 1000.0
+        if span <= 0:
+            return self.end_speed
+        u = min(1.0, max(0.0, (t - origin) / span))
+        return self.start_speed + (self.end_speed - self.start_speed) * u
 
     def _logged_positions(self) -> dict[int, list[tuple[int, float, float]]]:
         """Combat-log coordinates, dropping repeats of the same point."""
         out: dict[int, list[tuple[int, float, float]]] = {}
         for g in self.ghosts:
-            tr = self.tracks.track(g.aid)
+            tr = self.tracks.observed_track(g.aid)
             if tr is None:
                 continue
             pts: list[tuple[int, float, float]] = []
@@ -310,18 +368,23 @@ class P2Model:
             out[g.aid] = pts
         return out
 
-    def _simulate_ghosts(self, speed: float, face_deg: float) -> None:
+    def _simulate_ghosts(self) -> None:
         if not self.ghosts:
             return
         step = C.GHOST_STEP_MS
         pos: dict[int, tuple[float, float]] = {}
         samples: dict[int, list[Sample]] = {g.aid: [] for g in self.ghosts}
         log_i = {g.aid: 0 for g in self.ghosts}
+        held: dict[int, bool] = {}
+        released: dict[int, float] = {}
+        chased: dict[int, int] = {}
         t0 = min(g.spawn_t for g in self.ghosts)
         t1 = max(g.end_t for g in self.ghosts)
+        step = max(step, math.ceil((t1 - t0) / 100_000))
         by_id = {g.aid: g for g in self.ghosts}
         t = t0 - t0 % step
         while t <= t1 + step:
+            check_cancelled()
             for g in self.ghosts:
                 if not g.spawn_t <= t <= g.end_t + step:
                     continue
@@ -344,14 +407,31 @@ class P2Model:
                 if anchored:
                     continue
                 target = g.target_at(t)
+                if chased.get(g.aid) != target:
+                    chased[g.aid] = target
+                    held.pop(g.aid, None)
+                    released.pop(g.aid, None)
                 pose = self.tracks.pose(target, t) if target >= 0 else None
                 if pose is not None:
                     x, y = pos[g.aid]
                     tp = (pose.x, pose.y)
-                    staring = math.degrees(angle_diff(pose.facing, angle_to(tp, (x, y)))) <= face_deg
-                    if not staring:
+                    staring = math.degrees(angle_diff(pose.facing, angle_to(tp, (x, y)))) <= self.face_deg
+                    # Constant mode starts the pause on the step the stare ends. A new stare cancels it.
+                    if staring:
+                        held[g.aid] = True
+                        released.pop(g.aid, None)
+                    elif self.motion_mode != "accel" and self.pause_s > 0 and held.get(g.aid):
+                        released[g.aid] = t
+                        held[g.aid] = False
+                    release = released.get(g.aid)
+                    pausing = (
+                        self.motion_mode != "accel"
+                        and release is not None
+                        and t < release + self.pause_s * 1000.0
+                    )
+                    if not staring and not pausing:
                         d = distance((x, y), tp)
-                        move = min(d, speed * step / 1000.0)
+                        move = min(d, self._chase_speed(g, t) * step / 1000.0)
                         if d > 1e-6 and d > 1.0:
                             pos[g.aid] = (x + (tp[0] - x) / d * move, y + (tp[1] - y) / d * move)
             for gid, p in pos.items():
@@ -363,7 +443,8 @@ class P2Model:
             t += step
         for gid, lst in samples.items():
             if lst:
-                self.tracks.tracks[gid] = Track(lst)
+                g = by_id[gid]
+                self.tracks.set_derived(gid, Track(lst), active_span=(g.spawn_t, g.end_t))
         self._routes = {
             g.aid: movement_times(self.tracks.track(g.aid), g.spawn_t, g.end_t) for g in self.ghosts
         }
@@ -429,12 +510,21 @@ class P2Model:
                 if e.type == "SPELL_INTERRUPT" and e.dst == s.src and e.extra == C.WAIL:
                     end, outcome, kicker = e.t, "kicked", e.src
                     break
-                if e.type == "SPELL_AURA_APPLIED" and e.spell_id == C.WAIL and e.src == s.src:
+                if (
+                    e.type in ("SPELL_CAST_SUCCESS", "SPELL_AURA_APPLIED")
+                    and e.spell_id == C.WAIL
+                    and e.src == s.src
+                ):
                     end, outcome = e.t, "went_off"
-                    feared = sum(
-                        1
-                        for x in events_between(self.data, self.times, e.t, e.t + 200)
-                        if x.type == "SPELL_AURA_APPLIED" and x.spell_id == C.WAIL and x.src == s.src
+                    feared = len(
+                        {
+                            x.dst
+                            for x in events_between(self.data, self.times, e.t, e.t + 200)
+                            if x.type == "SPELL_AURA_APPLIED"
+                            and x.spell_id == C.WAIL
+                            and x.src == s.src
+                            and x.dst >= 0
+                        }
                     )
                     break
                 if e.type == "SPELL_CAST_START" and e.src == s.src and e.spell_id == C.WAIL:
@@ -454,8 +544,8 @@ class P2Model:
                 continue
             lst = out.setdefault(e.dst, [])
             if e.type == "SPELL_AURA_APPLIED":
-                lst.append((e.t, 2))
-            elif e.type == "SPELL_AURA_REMOVED_DOSE":
+                lst.append((e.t, e.amount or 2))
+            elif e.type in ("SPELL_AURA_APPLIED_DOSE", "SPELL_AURA_REMOVED_DOSE"):
                 lst.append((e.t, e.amount))
             elif e.type == "SPELL_AURA_REMOVED":
                 lst.append((e.t, 0))
@@ -551,6 +641,7 @@ class P2Model:
                 segs.append(name_seg(d, p))
             if b.cracked:
                 segs.append(Seg(f" · 打掉 {b.cracked} 层护盾", "#7ff0e8"))
+            segs.append(Seg(" · 光环结束，爆炸时间为推定", "#e8a33d"))
             out.append(LogEntry(b.t, segs, "gloombomb"))
         for w in self.wails:
             if w.outcome == "kicked":
@@ -598,11 +689,15 @@ class P2Model:
                 )
             )
         for fe in self.fixate_ends:
-            if fe.reason == "reached":
+            if fe.reason in ("reached", "unknown"):
                 out.append(
                     LogEntry(
                         fe.t,
-                        [Seg("鬼魂", C.C_GHOST, badge=True), Seg(" 追上了 "), name_seg(d, fe.player)],
+                        [
+                            Seg("鬼魂", C.C_GHOST, badge=True),
+                            Seg(" 推定追上了 " if fe.reason == "reached" else " 凝视解除，原因未知 → "),
+                            name_seg(d, fe.player),
+                        ],
                         "ghosts",
                     )
                 )
@@ -738,10 +833,13 @@ class P2Model:
         ends = [fe for fe in self.fixate_ends if fe.t <= t]
         severed = sum(n for _cs, st, _tk, n in self.soul_severs if st <= t)
         reached = sum(1 for fe in ends if fe.reason == "reached")
+        unknown = sum(1 for fe in ends if fe.reason == "unknown")
         res = sum(1 for rt, _ps in self.resonances if rt <= t)
         gh = StatusSection("鬼魂", C.C_GHOST)
         gh.rows.append([Cell(f"{len(out_now)} 个鬼魂在场", "#ffffff", bold=True)])
-        gh.note = f"累计：{severed} 被灵魂撕裂斩断 · {reached} 追上玩家 · {res} 次恶毒共鸣"
+        gh.note = (
+            f"累计：{severed} 被灵魂撕裂斩断 · {reached} 推定追上玩家 · {unknown} 原因未知 · {res} 次恶毒共鸣"
+        )
         secs.append(gh)
         if out_now:
             lst = StatusSection("在场鬼魂 · 追谁 · 来自 · 已出现", "#8b93a1")
@@ -767,7 +865,9 @@ class P2Model:
             if bombs:
                 row = [
                     Cell(", ".join(short(d, iv.actor) for iv in bombs), "#e8e8e8", True),
-                    Cell(f"{fmt_secs(max(iv.end for iv in bombs) - t)} 后爆炸", "#8b93a1", align="right"),
+                    Cell(
+                        f"预计 {fmt_secs(max(iv.end for iv in bombs) - t)} 后结束", "#8b93a1", align="right"
+                    ),
                 ]
                 gb.rows.append(row)
             for a in coils:

@@ -109,7 +109,7 @@ def globules_of(data: FightData, tracks: Tracks) -> list[Globule]:
     return out
 
 
-@dataclass(eq=False)
+@dataclass(slots=True, eq=False)
 class Globule:
     aid: int
     color: str
@@ -127,7 +127,7 @@ class Globule:
         return self.start <= t and (self.end is None or t < self.end)
 
 
-@dataclass(eq=False)
+@dataclass(slots=True, eq=False)
 class Carry:
     player: int
     color: str
@@ -138,7 +138,7 @@ class Carry:
     dropped: Globule | None = None
 
 
-@dataclass(eq=False)
+@dataclass(slots=True, eq=False)
 class SeverRec:
     idx: int
     cast_start: int
@@ -152,6 +152,7 @@ class SeverRec:
     floor_before: int = 0
     floor_after: int = 0
     popped: list[Globule] = field(default_factory=list)
+    inferred_pops: int = 0
 
 
 class P1Model:
@@ -269,20 +270,29 @@ class P1Model:
     # -- state machine ------------------------------------------------------------------------
 
     def _match_drops(self) -> None:
-        free = sorted(self.carries, key=lambda c: c.end)
-        for g in self.globules:
-            if g.origin != "drop":
+        pairs: list[tuple[float, int, int, int]] = []
+        for gi, globule in enumerate(self.globules):
+            if globule.origin != "drop":
                 continue
-            best = None
-            for c in free:
-                if c.dropped is not None or c.color != g.color:
+            options = []
+            for ci, carry in enumerate(self.carries):
+                dt = globule.start - carry.end
+                if carry.dropped is not None or carry.color != globule.color or not -100 <= dt <= 400:
                     continue
-                dt = g.start - c.end
-                if -100 <= dt <= 400 and (best is None or abs(dt) < abs(best.end - g.start)):
-                    best = c
-            if best is not None:
-                best.dropped = g
-                g.dropped_by = best.player
+                position = self.tracks.position(carry.player, carry.end)
+                separation = distance(position, (globule.x, globule.y)) if position else math.inf
+                if separation <= C.PICKUP_MAX_DIST or position is None:
+                    options.append((separation, abs(dt), ci))
+            options.sort()
+            if len(options) == 1 or (len(options) > 1 and options[0][:2] != options[1][:2]):
+                pairs.extend((separation, dt, gi, ci) for separation, dt, ci in options)
+        matched: set[int] = set()
+        for _separation, _dt, gi, ci in sorted(pairs):
+            globule, carry = self.globules[gi], self.carries[ci]
+            if gi not in matched and carry.dropped is None:
+                carry.dropped = globule
+                globule.dropped_by = carry.player
+                matched.add(gi)
 
     def _simulate(self) -> None:
         self._match_drops()
@@ -344,7 +354,9 @@ class P1Model:
         n = s.stacks
         chosen = in_cone[:n]
         if len(chosen) < n:
-            chosen += [g for _dev, _d, g in scored if g not in chosen][: n - len(chosen)]
+            inferred = [g for _dev, _d, g in scored if g not in chosen][: n - len(chosen)]
+            s.inferred_pops = len(inferred)
+            chosen += inferred
         return chosen
 
     # -- queries ------------------------------------------------------------------------------
@@ -445,6 +457,8 @@ class P1Model:
             untouched = sum(1 for g in s.popped if g.origin == "spawn")
             if untouched:
                 segs.append(Seg(f" · {untouched} 个未拾取的被引爆", "#e8a33d"))
+            if s.inferred_pops:
+                segs.append(Seg(f" · {s.inferred_pops} 个球位置由层数补推，扇形观测不足", "#e8a33d"))
             out.append(LogEntry(s.t, segs, "severs"))
         for s in self.blighted:
             segs = [
@@ -453,6 +467,8 @@ class P1Model:
                 name_seg(d, s.target),
                 Seg(f" · +{s.stacks} 毒液爆裂 · 地面 {s.floor_before} → {s.floor_after}"),
             ]
+            if s.inferred_pops:
+                segs.append(Seg(f" · {s.inferred_pops} 个球位置由层数补推，扇形观测不足", "#e8a33d"))
             out.append(LogEntry(s.t, segs, "severs"))
         for t in self.deluges:
             wave = [g for g in self.globules if g.origin == "spawn" and t <= g.start <= t + 6000]

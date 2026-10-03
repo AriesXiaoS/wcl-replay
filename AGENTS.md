@@ -14,9 +14,10 @@ uv run pytest
 uv run ruff check .
 uv run ruff format .
 uv run --no-dev --group package python tools/build_windows.py
+uv run python tools/pack_windows.py
 ```
 
-调试单次 pull：`uv run python tools/dump_pull.py LOG`。无界面截图：`uv run python tools/snapshot.py LOG --seq N --at 16 --out snapshots`。Windows 目录包在 `build/nuitka/`，`--console` 会保留控制台窗口。
+调试单次 pull：`uv run python tools/dump_pull.py LOG`。无界面截图：`uv run python tools/snapshot.py LOG --seq N --at 16 --out snapshots`。Windows 目录包在 `build/nuitka/wcl_replay_entry.dist/`，`--console` 会保留控制台窗口。`pack_windows.py` 打出带版本号的 zip，放在 `build/`，下一次构建删 `build/nuitka/` 时不会把它清掉。
 
 ## 结构
 

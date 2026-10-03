@@ -43,6 +43,9 @@ _PLATE_GAP = 12.0
 # Carry and ghost routes: small dots, packed tight, so they do not read as the cone dashes.
 _PATH_DOT_PX = 2.2
 _PATH_DOT_PITCH_PX = 3.4
+_PATH_POINTS = 4096
+_PATH_DOTS = 2048
+_GRID_LINES = 128
 
 
 def frame_bounds(
@@ -52,12 +55,17 @@ def frame_bounds(
 ) -> tuple[float, float, float, float]:
     """Square view around the players, expanded by nearby world markers only."""
     x0, x1, y0, y1 = player_box
+    if not all(math.isfinite(v) for v in player_box):
+        return (-50.0, 50.0, -50.0, 50.0)
+    original = player_box
     for x, y in markers:
-        if x0 - pad <= x <= x1 + pad and y0 - pad <= y <= y1 + pad:
+        if original[0] - pad <= x <= original[1] + pad and original[2] - pad <= y <= original[3] + pad:
             x0, x1 = min(x0, x), max(x1, x)
             y0, y1 = min(y0, y), max(y1, y)
-    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    cx, cy = x0 / 2 + x1 / 2, y0 / 2 + y1 / 2
     half = max(x1 - x0, y1 - y0, 1.0) / 2 + 6
+    if not all(math.isfinite(v) for v in (cx - half, cx + half, cy - half, cy + half)):
+        return (-50.0, 50.0, -50.0, 50.0)
     return (cx - half, cx + half, cy - half, cy + half)
 
 
@@ -91,10 +99,18 @@ def _top_round_rect(x: float, y: float, w: float, h: float, radius: float) -> QP
     return path
 
 
-def _dots_along(points: list[QPointF], pitch: float) -> list[QPointF]:
+def _dots_along(points: list[QPointF], pitch: float, budget: int = _PATH_DOTS) -> list[QPointF]:
     """Evenly spaced points along a screen polyline, including the tip."""
-    if not points:
+    if not points or not math.isfinite(pitch) or pitch <= 0 or budget < 2:
         return []
+    points = points[:_PATH_POINTS]
+    if any(not math.isfinite(v) for pt in points for v in (pt.x(), pt.y())):
+        return []
+    lengths = [math.hypot(b.x() - a.x(), b.y() - a.y()) for a, b in zip(points, points[1:], strict=False)]
+    total = sum(lengths)
+    if not math.isfinite(total):
+        return []
+    pitch = max(pitch, total / (budget - 1))
     out = [points[0]]
     carry = 0.0
     prev = points[0]
@@ -106,13 +122,15 @@ def _dots_along(points: list[QPointF], pitch: float) -> list[QPointF]:
             prev = cur
             continue
         walked = 0.0
-        while carry + seg - walked >= pitch:
+        while carry + seg - walked >= pitch and len(out) < budget - 1:
             walked += pitch - carry
             t = walked / seg
             out.append(QPointF(prev.x() + dx * t, prev.y() + dy * t))
             carry = 0.0
         carry += seg - walked
         prev = cur
+        if len(out) >= budget - 1:
+            break
     tip = points[-1]
     last = out[-1]
     if math.hypot(tip.x() - last.x(), tip.y() - last.y()) > pitch * 0.45:
@@ -133,6 +151,7 @@ class MapView(QWidget):
         self._hits: dict[int, tuple[QPointF, float]] = {}
         self._bounds = (-40.0, 40.0, -40.0, 40.0)
         ctl.sessionChanged.connect(self._on_session)
+        ctl.analysisChanged.connect(self._on_analysis)
         ctl.selectionChanged.connect(self.update)
         ctl.timeChanged.connect(lambda _t: self.update())
         ctl.layersChanged.connect(self.update)
@@ -145,17 +164,20 @@ class MapView(QWidget):
     # -- geometry -----------------------------------------------------------------------------
 
     def _on_session(self) -> None:
+        self._zoom = 1.0
+        self._pan = QPointF(0, 0)
+        self._on_analysis()
+
+    def _on_analysis(self) -> None:
         self._hits = {}
         s = self.ctl.session
         if s is None:
             return
-        if s.analysis.arena:
+        if s.analysis.arena and all(math.isfinite(v) for v in s.analysis.arena):
             self._bounds = s.analysis.arena
         else:
             box = s.tracks.bounds([p.id for p in s.data.players()], 1, 99)
             self._bounds = frame_bounds(box, [(m.x, m.y) for m in s.data.markers])
-        self._zoom = 1.0
-        self._pan = QPointF(0, 0)
         self.update()
 
     def _scale(self) -> float:
@@ -311,17 +333,24 @@ class MapView(QWidget):
         p.setBrush(QColor(theme.ARENA))
         p.drawRoundedRect(rect, 10, 10)
         p.setPen(QPen(QColor(theme.GRID), 1))
-        step = 10.0
+        span = max(x1 - x0, y1 - y0)
+        if not math.isfinite(span) or span <= 0:
+            return
+        step = max(10.0, span / (_GRID_LINES - 1), 48.0 / max(self._scale(), 1e-300))
         gx = math.ceil(x0 / step) * step
-        while gx < x1:
-            a, b = self.w2s(gx, y1), self.w2s(gx, y0)
+        for i in range(_GRID_LINES):
+            value = gx + i * step
+            if value >= x1:
+                break
+            a, b = self.w2s(value, y1), self.w2s(value, y0)
             p.drawLine(a, b)
-            gx += step
         gy = math.ceil(y0 / step) * step
-        while gy < y1:
-            a, b = self.w2s(x1, gy), self.w2s(x0, gy)
+        for i in range(_GRID_LINES):
+            value = gy + i * step
+            if value >= y1:
+                break
+            a, b = self.w2s(x1, value), self.w2s(x0, value)
             p.drawLine(a, b)
-            gy += step
 
     def _pen(self, color: str, alpha: float, width: float, dashed: bool) -> QPen:
         pen = QPen(qcolor(color, alpha), width)
@@ -356,8 +385,10 @@ class MapView(QWidget):
     def _draw_path(self, p: QPainter, pr: Path) -> None:
         an = self.ctl.session.analysis
         run: list[tuple[float, float]] = []
+        dots_left = _PATH_DOTS
 
         def flush() -> None:
+            nonlocal dots_left
             if len(run) < 2:
                 run.clear()
                 return
@@ -366,7 +397,9 @@ class MapView(QWidget):
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(qcolor(pr.color, pr.alpha))
                 radius = _PATH_DOT_PX / 2
-                for center in _dots_along(screen, _PATH_DOT_PITCH_PX):
+                centers = _dots_along(screen, _PATH_DOT_PITCH_PX, dots_left)
+                dots_left -= len(centers)
+                for center in centers:
                     p.drawEllipse(center, radius, radius)
             else:
                 path = QPainterPath()
@@ -380,7 +413,8 @@ class MapView(QWidget):
                 p.drawPath(path)
             run.clear()
 
-        for x, y in pr.points:
+        stride = max(1, math.ceil(len(pr.points) / _PATH_POINTS))
+        for x, y in pr.points[::stride]:
             if an.in_arena(x, y):
                 run.append((x, y))
             else:

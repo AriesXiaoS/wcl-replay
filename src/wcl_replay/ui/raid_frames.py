@@ -10,7 +10,7 @@ column and narrows every frame so the card stays the same height.
 Each frame is one health bar: the name sits in the upper half, and selected
 debuff icons sit in one row across the lower half. Icons start at about half
 the frame and shrink together when they would overflow. Which debuffs exist
-comes from the boss; nothing is drawn until the filter below the card is checked.
+comes from the boss. The filter under the card starts with every debuff on.
 """
 
 from __future__ import annotations
@@ -127,6 +127,7 @@ class _RaidGrid(QWidget):
         self.setObjectName("raidGrid")
         self.setMouseTracking(False)
         ctl.sessionChanged.connect(self.update)
+        ctl.analysisChanged.connect(self.update)
         ctl.timeChanged.connect(self.update)
         ctl.selectionChanged.connect(self.update)
 
@@ -297,8 +298,12 @@ class _AuraPopup(QFrame):
         super().hideEvent(event)
 
 
+# Keys shipped before resonance. An older saved list keeps those choices and turns newer debuffs on.
+_LEGACY_AURA_KEYS = frozenset({"entombed", "fixate", "caught", "carry"})
+
+
 class AuraFilter(QFrame):
-    """Dropdown under the raid card. Checks are per encounter and start empty."""
+    """Dropdown under the raid card. Checks are per encounter and start all on."""
 
     changed = Signal()
 
@@ -317,7 +322,7 @@ class AuraFilter(QFrame):
         title.setObjectName("stackTitle")
         lay.addWidget(title)
         self.button = QPushButton()
-        self.button.setToolTip("勾选后显示在血条下半行。默认都不显示。")
+        self.button.setToolTip("勾选后显示在血条下半行。第一次使用默认全部显示。")
         self.button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.button.clicked.connect(self._open)
         inner = QHBoxLayout(self.button)
@@ -337,6 +342,7 @@ class AuraFilter(QFrame):
         self._popup_lay.setSpacing(2)
 
         ctl.sessionChanged.connect(self._rebuild)
+        ctl.analysisChanged.connect(self._on_analysis)
         self._rebuild()
 
     def sizeHint(self) -> QSize:
@@ -378,7 +384,7 @@ class AuraFilter(QFrame):
             self._popup_lay.addWidget(note)
             self._set_summary()
             return
-        saved = self._load()
+        saved = self._load(auras)
         for aura in auras:
             box = QCheckBox(aura.label)
             box.setProperty("auraKey", aura.key)
@@ -396,6 +402,19 @@ class AuraFilter(QFrame):
             self._boxes.append(box)
         self._set_summary()
 
+    def _on_analysis(self) -> None:
+        selected = self.selected_keys()
+        known = {str(box.property("auraKey")) for box in self._boxes}
+        self._rebuild()
+        for box in self._boxes:
+            key = str(box.property("auraKey"))
+            if key in known:
+                box.blockSignals(True)
+                box.setChecked(key in selected)
+                box.blockSignals(False)
+        self._set_summary()
+        self.changed.emit()
+
     def _on_toggled(self, _checked: bool) -> None:
         self._set_summary()
         self._save()
@@ -408,12 +427,27 @@ class AuraFilter(QFrame):
     def _settings_key(self) -> str | None:
         if self._encounter is None:
             return None
+        return f"frame_auras/v2/{self._encounter}"
+
+    def _legacy_key(self) -> str | None:
+        if self._encounter is None:
+            return None
         return f"frame_auras/{self._encounter}"
 
-    def _load(self) -> set[str]:
+    def _load(self, auras: tuple) -> set[str]:
+        """First launch selects every debuff. A saved list is kept, and a newly added one starts on."""
+        keys = {aura.key for aura in auras}
         key = self._settings_key()
         if key is None or self.settings is None:
-            return set()
+            return keys
+        if self.settings.contains(key):
+            return self._parse(key)
+        legacy = self._legacy_key()
+        if legacy is not None and self.settings.contains(legacy):
+            return self._parse(legacy) | (keys - _LEGACY_AURA_KEYS)
+        return keys
+
+    def _parse(self, key: str) -> set[str]:
         raw = str(self.settings.value(key, "") or "")
         return {part for part in raw.split(",") if part}
 

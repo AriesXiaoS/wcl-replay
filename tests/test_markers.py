@@ -34,6 +34,8 @@ def test_clip_keeps_only_beams_up_during_the_pull():
 def test_zone_unload_does_not_clear_the_raid_markers():
     events = [_ev(1_000, True, idx, float(idx), 1.0) for idx in (0, 1, 2, 3, 5)]
     events += [_ev(20_000, False, idx) for idx in (0, 1, 2, 3, 5)]
+    for event in events[-5:]:
+        event.zone_unload = True
     events.append(_ev(50_000, False, 2))
     during = clip_world_markers(events, 30_000, 10_000, 3004)
     assert sorted(m.index for m in during) == [0, 1, 2, 3, 5]

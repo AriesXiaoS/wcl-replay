@@ -22,16 +22,18 @@ QPushButton:checked, QToolButton:checked {{ background: #3a3150; border-color: {
 QPushButton#logAction:disabled {{ background: {PANEL_2}; color: {TEXT_DIM}; border: 1px solid {BORDER}; }}
 QPushButton#logAction[busy="true"]:disabled {{ border-color: {ACCENT}; }}
 QComboBox {{ background: {PANEL_2}; border: 1px solid {BORDER}; border-radius: 6px; padding: 3px 8px; min-width: 320px; }}
+QComboBox#ghostMotion {{ min-width: 112px; max-width: 132px; padding: 3px 6px; }}
 QComboBox QAbstractItemView {{ background: {PANEL_2}; selection-background-color: #3a3150; }}
 QTextBrowser {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 8px; padding: 6px; }}
 QFrame#logCard {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 8px; }}
 QPushButton#modeBtn {{ padding: 3px 12px; }}
 QPushButton#modeBtn:checked {{ background: #3a3150; border-color: {ACCENT}; }}
-QPushButton#rowDelete {{
+QPushButton#rowDelete, QPushButton#rowStar {{
     padding: 0; min-width: 18px; max-width: 18px; min-height: 18px; max-height: 18px;
     border: none; background: transparent; color: {TEXT_DIM};
 }}
 QPushButton#rowDelete:hover {{ color: #e07070; background: transparent; }}
+QPushButton#rowStar:hover, QPushButton#rowStar[starred="true"] {{ color: #e8b84d; background: transparent; }}
 QListWidget {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 8px; outline: none; }}
 QListWidget::item {{ padding: 8px 10px; }}
 QListWidget::item:selected {{ background: #3a3150; color: {TEXT}; }}

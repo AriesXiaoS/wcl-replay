@@ -136,10 +136,21 @@ def convert(
     }
     events: list[Event] = []
     samples: dict[int, list[Sample]] = {}
+    diagnostics: dict[str, int] = {}
+
+    def diagnose(message: str) -> None:
+        diagnostics[message] = diagnostics.get(message, 0) + 1
 
     for ev in raw_events:
         typ = ev.get("type", "")
-        t = int(ev.get("timestamp", f0) - f0)
+        try:
+            t = int(ev.get("timestamp", f0) - f0)
+        except (ValueError, TypeError, OverflowError):
+            diagnose("已忽略无效事件时间")
+            continue
+        if not 0 <= t <= 2**63 - 1:
+            diagnose("已忽略无效事件时间")
+            continue
         src = actors.get(ev.get("sourceID"), ev.get("sourceInstance"))
         dst = actors.get(ev.get("targetID"), ev.get("targetInstance"))
         if typ == "combatantinfo":
@@ -153,6 +164,8 @@ def convert(
             continue
         spell = int(ev.get("abilityGameID") or 0)
         name = TYPE_MAP.get(typ, typ.upper())
+        if typ in ("heal", "damage") and ev.get("tick"):
+            name = "SPELL_PERIODIC_HEAL" if typ == "heal" else "SPELL_PERIODIC_DAMAGE"
         if typ == "damage":
             if spell == 1:
                 name = "SWING_DAMAGE"
@@ -181,23 +194,26 @@ def convert(
             who = ev.get("resourceActor", 2 if typ in ("damage", "heal") else 1)
             aid = src if who == 1 else dst if who == 2 else -1
             if aid >= 0:
-                lst = samples.setdefault(aid, [])
                 # API y is north. API x points east, so west is the negation. Facing is a math
                 # angle (0 = east, hundredths of a radian); the combat log measures it from north.
-                x = ev["y"] / COORD_SCALE
-                y = -ev["x"] / COORD_SCALE
-                facing = -(ev.get("facing") or 0) / COORD_SCALE - math.pi / 2
-                if not (lst and lst[-1].t == t and lst[-1].x == x and lst[-1].y == y):
-                    lst.append(
-                        Sample(
-                            t,
-                            x,
-                            y,
-                            facing,
-                            int(ev.get("hitPoints") or 0),
-                            int(ev.get("maxHitPoints") or 0),
-                        )
+                try:
+                    sample = Sample(
+                        t,
+                        float(ev["y"]) / COORD_SCALE,
+                        -float(ev["x"]) / COORD_SCALE,
+                        -float(ev.get("facing") or 0) / COORD_SCALE - math.pi / 2,
+                        int(ev.get("hitPoints") or 0),
+                        int(ev.get("maxHitPoints") or 0),
                     )
+                except (ValueError, TypeError, OverflowError):
+                    diagnose("已忽略格式错误的坐标样本")
+                    continue
+                if not sample.valid():
+                    diagnose("已忽略无效坐标或资源样本")
+                    continue
+                lst = samples.setdefault(aid, [])
+                if not lst or lst[-1] != sample:
+                    lst.append(sample)
 
     events.sort(key=lambda e_: e_.t)
     for lst in samples.values():
@@ -208,4 +224,5 @@ def convert(
         events=events,
         samples=samples,
         source=source,
+        diagnostics=diagnostics,
     )

@@ -19,6 +19,7 @@ from wcl_replay.bosses.coiled_altar.constants import (
     GREEN_CARRY,
     POSSESSED,
     PURPLE_CARRY,
+    RESONANCE,
 )
 from wcl_replay.bosses.coiled_altar.module import CoiledAltar, CoiledAltarAnalysis
 from wcl_replay.core.models import Actor, ActorKind, Event, Fight, FightData, Sample
@@ -36,13 +37,19 @@ def _fight(events: list[Event]) -> FightData:
     )
 
 
-def test_coiled_altar_lists_the_four_raid_debuffs_and_their_icons():
+def test_coiled_altar_lists_the_raid_debuffs_and_their_icons():
     QApplication.instance() or QApplication([])
     auras = CoiledAltarAnalysis.frame_auras
-    assert [aura.key for aura in auras] == ["entombed", "fixate", "caught", "carry"]
-    assert [aura.label for aura in auras] == ["墓缚", "被魂盯", "被魂撞", "搬球"]
+    assert [aura.key for aura in auras] == ["entombed", "fixate", "resonance", "caught", "carry"]
+    assert [aura.label for aura in auras] == [
+        "墓缚（点名大圈）",
+        "令人不安的凝视（被魂钉）",
+        "恶毒共鸣（撞魂）",
+        "恐惧行军（被心控）",
+        "烈性毒液 / 诱变毒液（搬球）",
+    ]
     spells = {spell_id for aura in auras for spell_id, _icon in aura.spells}
-    assert spells == {ENTOMBED, FIXATE, POSSESSED, GREEN_CARRY, PURPLE_CARRY}
+    assert spells == {ENTOMBED, FIXATE, RESONANCE, POSSESSED, GREEN_CARRY, PURPLE_CARRY}
     for aura in auras:
         for _spell_id, stem in aura.spells:
             assert aura_icon_path(stem).is_file()
@@ -58,6 +65,8 @@ def test_tracked_debuffs_are_reported_only_while_they_are_up():
         Event(3000, "SPELL_AURA_REMOVED", dst=1, spell_id=PURPLE_CARRY),
         Event(4000, "SPELL_AURA_APPLIED", dst=1, spell_id=POSSESSED),
         Event(4500, "SPELL_AURA_REMOVED", dst=1, spell_id=POSSESSED),
+        Event(4200, "SPELL_AURA_APPLIED", dst=1, spell_id=RESONANCE),
+        Event(5000, "SPELL_AURA_REMOVED", dst=1, spell_id=RESONANCE),
     ]
     data = _fight(events)
     analysis = CoiledAltar().analyze(data, Tracks(data))
@@ -67,6 +76,7 @@ def test_tracked_debuffs_are_reported_only_while_they_are_up():
     )
     assert analysis.active_frame_auras(1, 4200) == (
         ("entombed", "ability_demonhunter_shatteredsouls"),
+        ("resonance", "spell_malevolent_resonance"),
         ("caught", "spell_nzinsanity_fearofdeath"),
     )
     assert analysis.active_frame_auras(1, 6000) == ()

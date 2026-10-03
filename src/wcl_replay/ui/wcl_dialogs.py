@@ -17,13 +17,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..sources.wcl_api.urls import normalize_host
+from ..workers import test_credentials_job
+from .loader import TaskRunner
+
 HOSTS = ("www.warcraftlogs.com", "cn.warcraftlogs.com")
 
 
 class CredentialsDialog(QDialog):
-    def __init__(self, settings: QSettings, parent: QWidget | None = None):
+    def __init__(
+        self, settings: QSettings, parent: QWidget | None = None, *, runner: TaskRunner | None = None
+    ):
         super().__init__(parent)
         self.settings = settings
+        self.tasks = runner or TaskRunner(self)
+        self._owns_runner = runner is None
+        self._test_generation = 0
+        self.finished.connect(self._finished)
         self.setWindowTitle("WCL API 设置")
         self.setMinimumWidth(460)
 
@@ -48,7 +58,7 @@ class CredentialsDialog(QDialog):
         form.addRow("Client Secret", self.secret)
         form.addRow("API 域名", self.host)
 
-        test = QPushButton("测试连接")
+        test = self.test_btn = QPushButton("测试连接")
         test.clicked.connect(self._test)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -70,18 +80,51 @@ class CredentialsDialog(QDialog):
         )
 
     def _test(self) -> None:
-        from ..sources.wcl_api import WclClient
-
         cid, sec, host = self._values()
         try:
-            WclClient(cid, sec, host=host).token(force=True)
-        except Exception as exc:  # noqa: BLE001
+            host = normalize_host(host)
+            if not cid or not sec:
+                raise ValueError("Client ID 和 Client Secret 都需要填写。")
+        except ValueError as exc:
             QMessageBox.warning(self, "连接失败", str(exc))
             return
-        QMessageBox.information(self, "连接成功", "已成功获取 WCL API 访问令牌。")
+        self._test_generation += 1
+        generation = self._test_generation
+        self.test_btn.setEnabled(False)
+        self.test_btn.setText("正在测试…")
+        self._test_job = self.tasks.run(
+            test_credentials_job,
+            (cid, sec, host),
+            lambda _result: self._tested(generation),
+            lambda message: self._tested(generation, message),
+        )
+
+    def _tested(self, generation: int, error: str | None = None) -> None:
+        if generation != self._test_generation:
+            return
+        self.test_btn.setEnabled(True)
+        self.test_btn.setText("测试连接")
+        if error:
+            QMessageBox.warning(self, "连接失败", error.strip().splitlines()[-1])
+        else:
+            QMessageBox.information(self, "连接成功", "已成功获取 WCL API 访问令牌。")
+
+    def _finished(self, _result: int) -> None:
+        self._test_generation += 1
+        handle = getattr(self, "_test_job", None)
+        if handle is not None:
+            handle.cancel()
+            self._test_job = None
+        if self._owns_runner:
+            self.tasks.shutdown()
 
     def _save(self) -> None:
         cid, sec, host = self._values()
+        try:
+            host = normalize_host(host)
+        except ValueError as exc:
+            QMessageBox.warning(self, "WCL API 设置", str(exc))
+            return
         if not cid or not sec:
             QMessageBox.warning(self, "WCL API 设置", "Client ID 和 Client Secret 都需要填写。")
             return

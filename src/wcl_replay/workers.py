@@ -10,7 +10,9 @@ import sys
 import traceback
 from collections.abc import Callable
 from multiprocessing.queues import Queue
+from multiprocessing.reduction import ForkingPickler
 
+from .core.cancellation import TaskCancelled, cancel_check
 from .pipeline import analyze
 from .sources.local_log import EncounterEntry, index_log, parse_encounter
 
@@ -21,7 +23,10 @@ def worker_count() -> int:
     """Parallel child processes. One core stays with the UI, and the pool stays small."""
     raw = os.environ.get("WCL_REPLAY_WORKERS")
     if raw:
-        return max(1, int(raw))
+        try:
+            return max(1, min(8, int(raw)))
+        except ValueError:
+            pass
     cpus = os.cpu_count() or 2
     return max(1, min(4, cpus - 1))
 
@@ -43,7 +48,23 @@ def rate_limit_job(
     from .sources.wcl_api.client import WclClient
 
     progress(1.0, "")
-    return WclClient(client_id, client_secret, host=host or "cn.warcraftlogs.com").rate_limit()
+    client = WclClient(client_id, client_secret, host=host or "cn.warcraftlogs.com")
+    try:
+        return client.rate_limit()
+    finally:
+        client.close()
+
+
+def test_credentials_job(client_id: str, client_secret: str, host: str, progress: ProgressFn) -> bool:
+    from .sources.wcl_api.client import WclClient
+
+    progress(0.0, "正在测试连接…")
+    client = WclClient(client_id, client_secret, host=host)
+    try:
+        client.token(force=True)
+        return True
+    finally:
+        client.close()
 
 
 def fetch_wcl_job(url: str, client_id: str, client_secret: str, host: str, progress: ProgressFn) -> tuple:
@@ -66,7 +87,7 @@ def _report(results: Queue, job_id: int, frac: float, msg: str = "") -> None:
     results.put(("progress", job_id, float(frac), msg))
 
 
-def _serve(tasks: Queue, results: Queue) -> None:
+def _serve(tasks: Queue, results: Queue, cancellations=None) -> None:
     while True:
         try:
             item = tasks.get()
@@ -74,17 +95,28 @@ def _serve(tasks: Queue, results: Queue) -> None:
             return
         if item is None:
             return
-        job_id, fn, args = item
+        job_id, fn, args, *slots = item
+
+        def check(_slot: int | None = slots[0] if slots else None) -> None:
+            if cancellations is not None and _slot is not None and cancellations[_slot]:
+                raise TaskCancelled("任务已取消")
 
         def progress(frac: float, msg: str = "", _job: int = job_id) -> None:
+            check()
             _report(results, _job, frac, msg)
 
+        token = cancel_check.set(check)
         try:
+            check()
             result = fn(*args, progress)
+            check()
         except Exception:
             results.put(("fail", job_id, traceback.format_exc()))
             continue
+        finally:
+            cancel_check.reset(token)
         try:
+            ForkingPickler.dumps(("done", job_id, result))
             results.put(("done", job_id, result))
         except Exception:
             results.put(("fail", job_id, traceback.format_exc()))

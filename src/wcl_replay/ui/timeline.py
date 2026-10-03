@@ -27,6 +27,7 @@ class TimelineWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._scrubbing = False
         ctl.sessionChanged.connect(self._on_session)
+        ctl.analysisChanged.connect(self._on_session)
         ctl.timeChanged.connect(lambda _t: self.update())
         ctl.layersChanged.connect(self.update)
         self._on_session()

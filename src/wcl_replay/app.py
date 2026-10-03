@@ -8,16 +8,17 @@ from __future__ import annotations
 import multiprocessing
 import sys
 
-from PySide6.QtWidgets import QApplication
-
 from . import __version__
-from .ui.icon import configure_windows_taskbar, load_app_icon
-from .ui.main_window import MainWindow
-from .ui.theme import STYLE_SHEET
 
 
 def main() -> None:
     multiprocessing.freeze_support()
+    from PySide6.QtWidgets import QApplication
+
+    from .ui.icon import configure_windows_taskbar, load_app_icon
+    from .ui.main_window import MainWindow
+    from .ui.theme import STYLE_SHEET
+
     configure_windows_taskbar()
     app = QApplication(sys.argv)
     app.setApplicationName("WCL Replay")

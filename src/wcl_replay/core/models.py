@@ -9,6 +9,7 @@ Coordinates are WoW world coordinates in yards, in the order the combat log writ
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -72,6 +73,17 @@ class Sample:
     hp: int
     max_hp: int
 
+    def valid(self) -> bool:
+        try:
+            return (
+                isinstance(self.t, int)
+                and 0 <= self.t <= 2**63 - 1
+                and all(math.isfinite(v) for v in (self.x, self.y, self.facing))
+                and all(isinstance(v, int) and 0 <= v <= 2**63 - 1 for v in (self.hp, self.max_hp))
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+
 
 @dataclass(slots=True)
 class Fight:
@@ -125,6 +137,10 @@ class FightData:
     # Phase starts supplied by the data source (WCL), as (t, name).
     phases: list[tuple[int, str]] = field(default_factory=list)
     markers: list[WorldMarker] = field(default_factory=list)
+    diagnostics: dict[str, int] = field(default_factory=dict)
+
+    def diagnose(self, message: str, count: int = 1) -> None:
+        self.diagnostics[message] = self.diagnostics.get(message, 0) + count
 
     def players(self) -> list[Actor]:
         return [a for a in self.actors.values() if a.kind is ActorKind.PLAYER]

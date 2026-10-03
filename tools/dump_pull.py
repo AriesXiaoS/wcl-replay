@@ -3,9 +3,9 @@
 
 """Debug helper: list the encounters of a combat log, or dump spell / unit statistics of one pull.
 
-    uv run python tools/dump_pull.py LOG                     # list encounters
-    uv run python tools/dump_pull.py LOG --seq 31            # stats of encounter #31 (index order)
-    uv run python tools/dump_pull.py LOG --seq 31 --spell 1283485 --npc 268042   # raw events
+uv run python tools/dump_pull.py LOG                     # list encounters
+uv run python tools/dump_pull.py LOG --seq 31            # stats of encounter #31 (index order)
+uv run python tools/dump_pull.py LOG --seq 31 --spell 1283485 --npc 268042   # raw events
 """
 
 from __future__ import annotations
@@ -31,8 +31,13 @@ def main() -> None:
     ap.add_argument("--seq", type=int, help="encounter number in the index (1-based)")
     ap.add_argument("--spell", type=int, action="append", default=[], help="print events of this spell id")
     ap.add_argument("--npc", type=int, action="append", default=[], help="print events involving npc id")
-    ap.add_argument("--window", type=float, nargs=2, metavar=("FROM_S", "TO_S"),
-                    help="print every NPC-sourced event in this time window (seconds)")
+    ap.add_argument(
+        "--window",
+        type=float,
+        nargs=2,
+        metavar=("FROM_S", "TO_S"),
+        help="print every NPC-sourced event in this time window (seconds)",
+    )
     ap.add_argument("--limit", type=int, default=60)
     ap.add_argument("--top", type=int, default=80)
     args = ap.parse_args()
@@ -76,9 +81,7 @@ def main() -> None:
         spells = set(args.spell)
         shown = 0
         for e in data.events:
-            hit = e.spell_id in spells or any(
-                0 <= a and A[a].npc_id in npcs for a in (e.src, e.dst)
-            )
+            hit = e.spell_id in spells or any(0 <= a and A[a].npc_id in npcs for a in (e.src, e.dst))
             if not hit:
                 continue
             s = A[e.src].name if e.src >= 0 else "-"
@@ -88,7 +91,9 @@ def main() -> None:
                 if a >= 0 and A[a].npc_id in npcs and tracks.has(a):
                     p = tracks.pose(a, e.t)
                     pos += f" [{A[a].guid[-6:]} @{p.x:.1f},{p.y:.1f} f{p.facing:.2f}]"
-            print(f"{fmt_t(e.t)} {e.type} {s} -> {d} {e.spell_id} {e.spell_name} amt={e.amount} x={e.extra}{pos}")
+            print(
+                f"{fmt_t(e.t)} {e.type} {s} -> {d} {e.spell_id} {e.spell_name} amt={e.amount} x={e.extra}{pos}"
+            )
             shown += 1
             if shown >= args.limit:
                 break

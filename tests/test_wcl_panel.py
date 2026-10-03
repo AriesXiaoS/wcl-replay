@@ -99,3 +99,25 @@ def test_wcl_rows_accumulate_and_a_background_result_stays_cached():
     assert board.loads.cache == {}
     assert ctl.session is None
     assert panel.rows[0].mark.text() == ""
+
+
+def test_a_pinned_wcl_fight_stays_when_the_cache_is_cleared():
+    QApplication.instance() or QApplication([])
+    ctl = ReplayController()
+    panel = WclPanel()
+    board = WclBoard(ctl, panel)
+    _index, key = board.begin("https://cn.warcraftlogs.com/reports/ya73XMW2TkvcnRQV?fight=3")
+    kept = _session()
+    assert board.finish(key, kept, "收藏的一场") is True
+    panel.rows[0].star_btn.click()
+    assert panel.rows[0].star_btn.text() == "★"
+
+    board.clear_cache()
+    assert board.loads.cache == {key: kept}
+    assert ctl.session is kept
+    assert panel.rows[0].mark.text() == "✓"
+    assert panel.rows[0].star_btn.text() == "★"
+
+    panel.rows[0].delete_btn.click()
+    assert board.loads.cache == {}
+    assert key not in board.pinned

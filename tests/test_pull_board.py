@@ -11,7 +11,7 @@ from types import SimpleNamespace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QProgressBar, QToolBar
 
@@ -250,6 +250,63 @@ def test_eviction_follows_click_order_when_results_finish_out_of_order():
     assert board.keys[2] in board.loads.cache
     assert panel.rows[0].mark.text() == ""
     assert panel.rows[1].mark.text() == "✓"
+
+
+def test_a_pinned_pull_is_kept_when_the_cache_fills_and_when_it_is_cleared():
+    _app, ctl, panel, board = _board()
+    board._limit = lambda: 2
+    path = r"D:\Logs\WoWCombatLog.txt"
+    gen = board.prepare(path)
+    board.show_entries(gen, path, [_entry(0, 1, "最早"), _entry(200, 2, "中间"), _entry(400, 3, "最新")])
+    oldest, newest = board.keys[2], board.keys[0]
+    assert board.activate(2) == "start"
+    assert board.finish(gen, path, oldest, _session()) is True
+    assert board.activate(0) == "start"
+    assert board.finish(gen, path, newest, _session()) is True
+    panel.rows[2].star_btn.click()
+    assert panel.rows[2].star_btn.text() == "★"
+    assert oldest in board.pinned
+
+    assert board.activate(1) == "start"
+    assert oldest in board.loads.cache
+    assert newest not in board.loads.cache
+    assert panel.rows[2].mark.text() == "✓"
+    assert panel.rows[2].star_btn.text() == "★"
+
+    kept = board.loads.cache[oldest]
+    board.loads.selected = oldest
+    ctl.set_session(kept)
+    board.clear_cache()
+    assert board.loads.cache == {oldest: kept}
+    assert ctl.session is kept
+    assert panel.rows[2].mark.text() == "✓"
+    assert panel.rows[2].star_btn.text() == "★"
+
+    panel.rows[2].star_btn.click()
+    assert panel.rows[2].star_btn.text() == "☆"
+    board.clear_cache()
+    assert oldest not in board.loads.cache
+    assert panel.rows[2].mark.text() == ""
+
+
+def test_a_pin_comes_back_when_the_same_log_is_listed_again(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    ctl = ReplayController()
+    panel = LogPanel()
+    board = PullBoard(ctl, panel, limit=lambda: 3, settings=settings)
+    path = r"D:\Logs\WoWCombatLog.txt"
+    gen = board.prepare(path)
+    board.show_entries(gen, path, [_entry(0, 1, "祖尔加")])
+    panel.rows[0].star_btn.click()
+    again = PullBoard(ReplayController(), LogPanel(), settings=settings)
+    gen = again.prepare(path)
+    again.show_entries(gen, path, [_entry(0, 1, "祖尔加")])
+    assert again.panel.rows[0].star_btn.text() == "★"
+    assert again.keys[0] in again.pinned
+    panel.close()
+    again.panel.close()
+    app.processEvents()
 
 
 def test_releasing_a_pull_keeps_the_row_and_drops_memory():

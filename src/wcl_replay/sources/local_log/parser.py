@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import math
 from collections.abc import Callable
 from pathlib import Path
 
@@ -56,7 +58,9 @@ ADV_LEN = 19
 
 def advanced_base(event: str) -> int | None:
     """Index of the advanced block's infoGUID for an event type, or None if it has none."""
-    if event.startswith("SWING_") or event.startswith("ENVIRONMENTAL_"):
+    if event.startswith("ENVIRONMENTAL_"):
+        base = 10
+    elif event.startswith("SWING_"):
         base = 9
     elif event.startswith(("SPELL_", "RANGE_")) or event in ("DAMAGE_SPLIT", "DAMAGE_SHIELD"):
         base = 12
@@ -74,6 +78,8 @@ def parse_map_change(line: str) -> MapInfo | None:
         return None
     try:
         x0, x1, y0, y1 = (float(v) for v in f[3:7])
+        if not all(math.isfinite(v) for v in (x0, x1, y0, y1)):
+            return None
         return MapInfo(int(f[1]), f[2], max(x0, x1), min(x0, x1), max(y0, y1), min(y0, y1))
     except ValueError:
         return None
@@ -102,6 +108,10 @@ class _Builder:
         self.by_guid: dict[str, int] = {}
         self.actors: dict[int, Actor] = {}
         self.samples: dict[int, list[Sample]] = {}
+        self.diagnostics: dict[str, int] = {}
+
+    def diagnose(self, message: str) -> None:
+        self.diagnostics[message] = self.diagnostics.get(message, 0) + 1
 
     def actor(self, guid: str, name: str = "", flags: int = 0) -> int:
         if guid in NO_GUID:
@@ -145,6 +155,11 @@ class _Builder:
             hp = int(f[base + ADV_HP])
             max_hp = int(f[base + ADV_MAXHP])
         except ValueError:
+            self.diagnose("已忽略格式错误的坐标样本")
+            return
+        sample = Sample(t, x, y, facing, hp, max_hp)
+        if not sample.valid():
+            self.diagnose("已忽略无效坐标或资源样本")
             return
         aid = self.actor(guid)
         owner = f[base + ADV_OWNER]
@@ -155,9 +170,9 @@ class _Builder:
                 if a.kind is ActorKind.NPC and owner.startswith("Player-"):
                     a.kind = ActorKind.PET
         lst = self.samples.setdefault(aid, [])
-        if lst and lst[-1].t == t and lst[-1].x == x and lst[-1].y == y:
+        if lst and lst[-1] == sample:
             return
-        lst.append(Sample(t, x, y, facing, hp, max_hp))
+        lst.append(sample)
 
 
 def _int(s: str) -> int:
@@ -175,10 +190,17 @@ def parse_encounter(
     with open(path, "rb") as fh:
         fh.seek(entry.start_offset)
         raw = fh.read(entry.end_offset - entry.start_offset)
+    if entry.content_digest and hashlib.blake2b(raw, digest_size=16).hexdigest() != entry.content_digest:
+        raise ValueError("这场战斗的日志内容已改变，请刷新列表后重新计算")
     lines = raw.decode("utf-8", "replace").splitlines()
+    incomplete_tail = not entry.closed and raw and not raw.endswith(b"\n")
+    if incomplete_tail:
+        lines.pop()
     del raw
 
     b = _Builder()
+    if incomplete_tail:
+        b.diagnose("末尾记录尚未写完，等待刷新补齐")
     events: list[Event] = []
     map_info = parse_map_change(entry.map_line) if entry.map_line else None
     start_ms: int | None = None
@@ -195,16 +217,23 @@ def parse_encounter(
         try:
             abs_ms = parse_ts_ms(ts)
         except ValueError:
+            b.diagnose("已忽略格式错误的事件时间")
             continue
         if start_ms is None:
             start_ms = abs_ms
         t = abs_ms - start_ms
+        if t < 0:
+            b.diagnose("已忽略战斗开始前的事件")
+            continue
         if t > last_t:
             last_t = t
         ev = rest[: rest.find(",")] if "," in rest else rest
 
         if ev == "COMBATANT_INFO":
             head = rest.split(",[", 1)[0].split(",")
+            if len(head) < 3:
+                b.diagnose("已忽略不完整的 COMBATANT_INFO")
+                continue
             aid = b.actor(head[1])
             spec = _int(head[-1])
             if aid >= 0 and spec:
@@ -222,6 +251,7 @@ def parse_encounter(
 
         f = split_fields(rest)
         if len(f) < 9:
+            b.diagnose("已忽略不完整的事件记录")
             continue
         src = b.actor(f[1], f[2], _flags(f[3]))
         dst = b.actor(f[5], f[6], _flags(f[7]))
@@ -232,9 +262,15 @@ def parse_encounter(
 
         base = advanced_base(ev)
         if base is not None:
-            b.sample(f, base, t)
-            if ev.endswith(_AMOUNT_SUFFIXES) and len(f) > base + ADV_LEN:
-                e.amount = _int(f[base + ADV_LEN])
+            advanced = len(f) >= base + ADV_LEN and (
+                f[base] in NO_GUID
+                or f[base].startswith(("Player-", "Creature-", "Pet-", "Vehicle-", "GameObject-"))
+            )
+            if advanced:
+                b.sample(f, base, t)
+            amount_index = base + ADV_LEN if advanced else base
+            if ev.endswith(_AMOUNT_SUFFIXES) and len(f) > amount_index:
+                e.amount = _int(f[amount_index])
 
         if ev.startswith("SPELL_AURA"):
             if len(f) > 12:
@@ -284,4 +320,5 @@ def parse_encounter(
         source=f"local:{Path(path).name}",
         map_info=map_info,
         markers=markers,
+        diagnostics=b.diagnostics,
     )

@@ -9,6 +9,28 @@ from urllib.parse import parse_qs, urlparse
 _CODE = re.compile(r"^[A-Za-z0-9]{16}$")
 
 
+def normalize_host(value: str) -> str:
+    """Accept official domain boundaries, never userinfo or custom authentication endpoints."""
+    parsed = urlparse(value.strip() if "://" in value else "https://" + value.strip())
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port not in (None, 443)
+        or not re.fullmatch(r"(?:[a-z0-9]+(?:-[a-z0-9]+)*\.)*warcraftlogs\.com", host)
+    ):
+        raise ValueError("API 域名必须是 warcraftlogs.com 的 HTTPS 官方域名")
+    return host
+
+
+def report_host(url: str) -> str | None:
+    value = url.strip()
+    if _CODE.fullmatch(value):
+        return None
+    return normalize_host(value)
+
+
 def parse_report_url(url: str) -> tuple[str, int | None]:
     """Report code and fight id from a WCL report link (or a bare report code).
 
@@ -19,9 +41,8 @@ def parse_report_url(url: str) -> tuple[str, int | None]:
     if _CODE.match(s):
         return s, None
     u = urlparse(s if "://" in s else "https://" + s)
-    if not u.netloc.endswith("warcraftlogs.com"):
-        raise ValueError(f"不是 warcraftlogs.com 的链接：{url}")
-    m = re.search(r"/reports/([A-Za-z0-9]+)", u.path)
+    normalize_host(s)
+    m = re.fullmatch(r"/reports/([A-Za-z0-9]{16})/?", u.path)
     if not m:
         raise ValueError(f"链接里没有报告代码（/reports/XXXX）：{url}")
     code = m.group(1)

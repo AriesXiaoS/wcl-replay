@@ -3,7 +3,7 @@
 
 """Render the main window for a pull at given times to PNG files (works headless).
 
-    uv run python tools/snapshot.py LOG --seq 31 --at 16 203 --out snapshots
+uv run python tools/snapshot.py LOG --seq 31 --at 16 203 --out snapshots
 """
 
 from __future__ import annotations
@@ -20,11 +20,13 @@ def main() -> None:
     ap.add_argument("--seq", type=int, required=True)
     ap.add_argument("--at", type=float, nargs="+", default=[16.0])
     ap.add_argument("--out", default="snapshots")
+    ap.add_argument("--settings", help="optional isolated INI settings file")
     ap.add_argument("--options", default="names,hp", help="comma separated: names,player_hp,hp,key")
     args = ap.parse_args()
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     os.environ.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")
 
+    from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
 
     from wcl_replay.pipeline import analyze
@@ -35,26 +37,33 @@ def main() -> None:
 
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLE_SHEET)
-    entry = index_log(args.log)[args.seq - 1]
+    entries = index_log(args.log)
+    if not 1 <= args.seq <= len(entries):
+        ap.error(f"seq must be between 1 and {len(entries)}")
+    entry = entries[args.seq - 1]
     data = parse_encounter(args.log, entry)
     tracks, analysis = analyze(data)
-    win = MainWindow()
+    settings = QSettings(args.settings, QSettings.Format.IniFormat) if args.settings else None
+    win = MainWindow(settings=settings)
     win.resize(1500, 980)
     win.show()
     win.ctl.set_session(Session(data, tracks, analysis))
     for key in ("names", "player_hp", "hp", "key"):
         win.ctl.set_option(key, key in args.options.split(","))
     out = Path(args.out)
-    out.mkdir(exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
     for sec in args.at:
         win.ctl.seek(sec * 1000)
         for _ in range(5):
             app.processEvents()
-        win.findChild(type(win.centralWidget())).widget(1).widget(0)._render()
+        win.status_panel._render()
         app.processEvents()
         path = out / f"pull{entry.pull_number}_{int(sec):04d}.png"
-        win.grab().save(str(path))
+        if not win.grab().save(str(path)):
+            raise OSError(f"cannot save snapshot: {path}")
         print(path)
+    win.close()
+    win.tasks.shutdown()
 
 
 if __name__ == "__main__":

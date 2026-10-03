@@ -33,6 +33,7 @@ class MarkerEvent:
     x: float = 0.0
     y: float = 0.0
     instance_id: int = 0
+    zone_unload: bool = False
 
 
 # /wm 1..8, stored 0-based as the combat log writes them.
@@ -53,23 +54,8 @@ def style_of(index: int) -> MarkerStyle:
 
 
 def _zone_unload_removes(events: list[MarkerEvent]) -> set[tuple[int, int]]:
-    """Removes fired together when the client leaves the instance.
-
-    Zoning out writes ``WORLD_MARKER_REMOVED`` for every beam the client still knows, in one
-    burst, without anyone clearing them. A real clear is one index on its own.
-    """
-    removes = sorted((e for e in events if not e.placed), key=lambda e: e.abs_ms)
-    skip: set[tuple[int, int]] = set()
-    i = 0
-    while i < len(removes):
-        j = i + 1
-        while j < len(removes) and removes[j].abs_ms - removes[i].abs_ms <= 100:
-            j += 1
-        cluster = removes[i:j]
-        if len({e.index for e in cluster}) >= 4:
-            skip.update((e.abs_ms, e.index) for e in cluster)
-        i = j
-    return skip
+    """Only the source's explicit zone-change context makes a removal non-authoritative."""
+    return {(event.abs_ms, event.index) for event in events if not event.placed and event.zone_unload}
 
 
 def clip_world_markers(

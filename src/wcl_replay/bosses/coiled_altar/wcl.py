@@ -10,6 +10,8 @@ list, so their spawn and coordinates are a name filter. Soul fixate is a debuff.
 
 from __future__ import annotations
 
+import json
+
 from ..base import WclSlice
 from . import constants as C
 
@@ -41,10 +43,31 @@ def _or(*parts: str) -> str:
 
 
 def slices(report: dict, fight: dict) -> tuple[WclSlice, ...]:
-    del report, fight
+    del fight
     auras = _or(*(f"ability.id = {spell_id}" for spell_id in _AURAS))
+    names = (
+        sorted(
+            {
+                actor["name"]
+                for actor in (report.get("masterData") or {}).get("actors", [])
+                if actor.get("gameID") in (C.NPC_GREEN, C.NPC_PURPLE) and actor.get("name")
+            }
+        )
+        or _ORB_NAMES
+    )
     orbs = _or(
-        *(part for name in _ORB_NAMES for part in (f'source.name = "{name}"', f'target.name = "{name}"'))
+        *(
+            part
+            for name in names
+            for part in (
+                f"source.name = {json.dumps(name, ensure_ascii=False)}",
+                f"target.name = {json.dumps(name, ensure_ascii=False)}",
+            )
+        ),
+        *(
+            f"ability.id = {spell}"
+            for spell in (C.GREEN_PLACE, C.PURPLE_PLACE, C.GREEN_SUMMON, C.PURPLE_SUMMON)
+        ),
     )
     return (
         WclSlice("敌方施法", "Casts", hostility="Enemies", resources=True),

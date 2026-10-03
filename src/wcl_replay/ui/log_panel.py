@@ -5,10 +5,11 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QRectF, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QFrame,
@@ -37,7 +38,35 @@ def pull_label(entry: EncounterEntry) -> str:
 
 
 def pull_key(path: str, entry: EncounterEntry) -> tuple:
-    return ("local", path, entry.start_offset, entry.end_offset)
+    key = ("local", path, entry.start_offset, entry.end_offset)
+    digest = entry.analysis_digest or entry.content_digest
+    return (*key, digest) if digest else key
+
+
+def pin_token(key: tuple) -> str | None:
+    """Stable text for a local pull. WCL rows live only until the process exits."""
+    if len(key) not in (4, 5) or key[0] != "local":
+        return None
+    return json.dumps(list(key[1:]), ensure_ascii=False)
+
+
+def pins_from_settings(settings: QSettings | None) -> set[tuple]:
+    if settings is None:
+        return set()
+    raw = settings.value("pinned_local_pulls", []) or []
+    if isinstance(raw, str):
+        raw = [raw]
+    pins: set[tuple] = set()
+    for item in raw:
+        try:
+            path, start, end, *digest = json.loads(str(item))
+            if len(digest) > 1:
+                continue
+            key = ("local", str(path), int(start), int(end))
+            pins.add((*key, str(digest[0])) if digest else key)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return pins
 
 
 def short_error(tb: str) -> str:
@@ -58,12 +87,27 @@ class PullLoads:
         self.cache: dict[tuple, object] = {}
         self.running: set[tuple] = set()
         self.order: list[tuple] = []
+        self._run_ids: dict[tuple, int] = {}
+        self._seq = 0
+        self._handles: dict[tuple, object] = {}
+
+    def bind(self, key: tuple, handle: object) -> None:
+        if handle is None:
+            return
+        if key in self.running:
+            self._handles[key] = handle
+        else:
+            handle.cancel()
 
     def reset(self) -> None:
+        for handle in list(self._handles.values()):
+            handle.cancel()
+        self._handles.clear()
         self.selected = None
         self.cache.clear()
         self.running.clear()
         self.order.clear()
+        self._run_ids.clear()
 
     def click(self, key: tuple) -> str:
         """``show`` if cached, ``wait`` if already running, ``start`` if this click begins work."""
@@ -73,19 +117,34 @@ class PullLoads:
         if key in self.running:
             return "wait"
         self.running.add(key)
+        self._seq += 1
+        self._run_ids[key] = self._seq
         self.remember(key)
         return "start"
 
     def complete(self, key: tuple, session: object) -> bool:
         """Store the result. True only when this pull is still the one the user has selected."""
         self.running.discard(key)
+        self._handles.pop(key, None)
+        self._run_ids.pop(key, None)
         self.cache[key] = session
         self.remember(key)
         return self.selected == key
 
     def abandon(self, key: tuple) -> None:
         self.running.discard(key)
+        self._run_ids.pop(key, None)
         self.forget_order(key)
+        handle = self._handles.pop(key, None)
+        if handle is not None:
+            handle.cancel()
+
+    def run_id(self, key: tuple) -> int:
+        return self._run_ids[key]
+
+    def is_current(self, key: tuple, run_id: int | None) -> bool:
+        # Asynchronous callers supply the token captured when the job was started.
+        return key in self.running and (run_id is None or self._run_ids.get(key) == run_id)
 
     def remember(self, key: tuple) -> None:
         """Record a calculation the first time it starts. A later view does not move it."""
@@ -102,10 +161,19 @@ class PullLoads:
 class _PullRow(QFrame):
     clicked = Signal()
     deleteClicked = Signal()
+    starClicked = Signal()
 
-    def __init__(self, label: str, parent: QWidget | None = None, *, action_tip: str = "释放这场的内存"):
+    def __init__(
+        self,
+        label: str,
+        parent: QWidget | None = None,
+        *,
+        action_tip: str = "释放这场的内存",
+        star_tip: str = "收藏。缓存满了或清除缓存时都会留下这场。",
+    ):
         super().__init__(parent)
         self.setObjectName("pullRow")
+        self._star_tip = star_tip
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 6, 8, 6)
         lay.setSpacing(4)
@@ -116,6 +184,11 @@ class _PullRow(QFrame):
         self.text = QLabel(label)
         self.text.setWordWrap(True)
         self.text.setToolTip(label)
+        self.star_btn = QPushButton("☆")
+        self.star_btn.setObjectName("rowStar")
+        self.star_btn.setFixedSize(18, 18)
+        self.star_btn.setToolTip(star_tip)
+        self.star_btn.clicked.connect(self.starClicked.emit)
         self.delete_btn = QPushButton("×")
         self.delete_btn.setObjectName("rowDelete")
         self.delete_btn.setFixedSize(18, 18)
@@ -123,6 +196,7 @@ class _PullRow(QFrame):
         self.delete_btn.clicked.connect(self.deleteClicked.emit)
         top.addWidget(self.mark)
         top.addWidget(self.text, 1)
+        top.addWidget(self.star_btn)
         top.addWidget(self.delete_btn)
         lay.addLayout(top)
         self.bar = QProgressBar()
@@ -143,6 +217,13 @@ class _PullRow(QFrame):
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(event)
+
+    def set_starred(self, on: bool) -> None:
+        self.star_btn.setText("★" if on else "☆")
+        self.star_btn.setProperty("starred", on)
+        self.star_btn.setToolTip("已收藏，不会被自动清掉。" if on else self._star_tip)
+        self.star_btn.style().unpolish(self.star_btn)
+        self.star_btn.style().polish(self.star_btn)
 
     def set_selected(self, on: bool) -> None:
         self.setProperty("selected", on)
@@ -251,11 +332,12 @@ class LogPanel(QFrame):
     clearClicked = Signal()
     activated = Signal(int)
     releaseRequested = Signal(int)
+    starToggled = Signal(int)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("logCard")
-        self.setMinimumWidth(280)
+        self.setMinimumWidth(340)
         self._rows: list[_PullRow] = []
         self._selected: int | None = None
         self._has_file = False
@@ -334,6 +416,7 @@ class LogPanel(QFrame):
             row = _PullRow(label, self._body)
             row.clicked.connect(lambda r=row: self.activated.emit(self._rows.index(r)))
             row.deleteClicked.connect(lambda r=row: self.releaseRequested.emit(self._rows.index(r)))
+            row.starClicked.connect(lambda r=row: self.starToggled.emit(self._rows.index(r)))
             self._rows.append(row)
             self._list.addWidget(row)
         self._list.addStretch(1)
@@ -363,16 +446,27 @@ class LogPanel(QFrame):
 class PullBoard:
     """Ties the pull list to the replay session. A finished job is shown only if it is still selected.
 
-    Refreshing the same log keeps results whose byte range did not change. A pull that was still
-    open, or whose log bytes grew, gets a new key and is computed again.
+    Refreshing the same log keeps results whose bytes and map/marker context did not change.
+    A pull whose content or analysis context changed gets a new key and is computed again.
     """
 
-    def __init__(self, ctl: ReplayController, panel: LogPanel, limit: Callable[[], int] | None = None):
+    def __init__(
+        self,
+        ctl: ReplayController,
+        panel: LogPanel,
+        limit: Callable[[], int] | None = None,
+        settings: QSettings | None = None,
+        active: Callable[[], bool] | None = None,
+    ):
         self.ctl = ctl
         self.panel = panel
+        self.settings = settings
+        self.active = active or (lambda: True)
         self._limit = limit or (lambda: 3)
         self.loads = PullLoads()
+        self.pinned = pins_from_settings(settings)
         self.panel.releaseRequested.connect(self.release)
+        self.panel.starToggled.connect(self.toggle_pin)
         self.gen = 0
         self.path = ""
         self.entries: list[EncounterEntry] = []
@@ -395,7 +489,7 @@ class PullBoard:
         self.panel.set_pulls([])
         if source is not None:
             self.panel.set_reading(source)
-        if not same_log or self.loads.selected not in self.loads.cache:
+        if self.active() and (not same_log or self.loads.selected not in self.loads.cache):
             self.ctl.clear_session()
         return self.gen
 
@@ -406,16 +500,30 @@ class PullBoard:
         self.keys = [pull_key(path, entry) for entry in self.entries]
         self._index = {key: i for i, key in enumerate(self.keys)}
         self._listed = True
+        self._migrate_legacy_pins()
         self._drop_stale(path)
         self.panel.set_status(f"{len(entries)} 次遭遇战")
         self.panel.set_pulls([pull_label(entry) for entry in self.entries])
         self.panel.set_reading(None)
         for key, index in self._index.items():
+            if key in self.pinned:
+                self.panel.rows[index].set_starred(True)
             if key in self.loads.cache:
                 self.panel.mark_done(index)
             elif key in self.loads.running:
                 self.panel.show_progress(index, 0.0)
         self._restore_selection()
+
+    def toggle_pin(self, index: int) -> None:
+        if not 0 <= index < len(self.keys):
+            return
+        key = self.keys[index]
+        if key in self.pinned:
+            self.pinned.discard(key)
+        else:
+            self.pinned.add(key)
+        self.panel.rows[index].set_starred(key in self.pinned)
+        self._save_pins()
 
     def index_failed(self, gen: int, message: str) -> None:
         if gen != self.gen:
@@ -428,30 +536,34 @@ class PullBoard:
         action = self.loads.click(key)
         self.panel.set_selected(index)
         if action == "show":
-            self.ctl.set_session(self.loads.cache[key])
+            if self.active():
+                self.ctl.set_session(self.loads.cache[key])
         elif action == "start":
             self.panel.show_progress(index, 0.0)
             self._make_room()
         return action
 
-    def note_progress(self, _gen: int, path: str, key: tuple, frac: float) -> None:
-        if path != self.path or key not in self._index or key not in self.loads.running:
+    def note_progress(
+        self, _gen: int, path: str, key: tuple, frac: float, *, run_id: int | None = None
+    ) -> None:
+        if path != self.path or key not in self._index or not self.loads.is_current(key, run_id):
             return
         self.panel.show_progress(self._index[key], frac)
 
-    def finish(self, _gen: int, path: str, key: tuple, session: object) -> bool:
+    def finish(self, _gen: int, path: str, key: tuple, session: object, *, run_id: int | None = None) -> bool:
         """Keep a result for this log even when a refresh bumped the index generation.
 
-        The byte range is part of ``key``, so a pull whose slice changed is a different key.
+        The range and analysis digest are part of ``key``, so changed input is a different key.
         """
         if path != self.path:
             return False
-        if key not in self.loads.running:
+        if not self.loads.is_current(key, run_id):
             return False
         if self._listed and key not in self._index:
             self.loads.abandon(key)
             return False
         show = self.loads.complete(key, session)
+        show = show and self.active()
         if key not in self._index:
             return False
         self.panel.mark_done(self._index[key])
@@ -465,8 +577,7 @@ class PullBoard:
         if not 0 <= index < len(self.keys):
             return
         key = self.keys[index]
-        self.loads.running.discard(key)
-        self.loads.forget_order(key)
+        self.loads.abandon(key)
         session = self.loads.cache.pop(key, None)
         if session is not None and self.ctl.session is session:
             self.ctl.clear_session()
@@ -497,7 +608,7 @@ class PullBoard:
 
     def _evict_one(self, keep: tuple | None = None) -> bool:
         for key in list(self.loads.order):
-            if key == keep or key in self.loads.running or key not in self.loads.cache:
+            if key == keep or key in self.loads.running or key not in self.loads.cache or key in self.pinned:
                 continue
             self._forget(key, self._index.get(key))
             return True
@@ -515,19 +626,23 @@ class PullBoard:
             self.panel.clear_done(index)
 
     def clear_cache(self) -> None:
-        """Drop finished results. A pull that is still computing is left alone."""
-        self.loads.cache.clear()
-        self.loads.order = [key for key in self.loads.order if key in self.loads.running]
-        if self.loads.selected not in self.loads.running:
-            self.loads.selected = None
-            self.panel.set_selected(None)
-        self.ctl.clear_session()
+        """Drop finished results. A pinned pull, and one that is still computing, stay."""
+        self.loads.cache = {key: session for key, session in self.loads.cache.items() if key in self.pinned}
+        self.loads.order = [
+            key for key in self.loads.order if key in self.loads.running or key in self.loads.cache
+        ]
+        if self.loads.selected not in self.loads.cache:
+            if self.loads.selected not in self.loads.running:
+                self.loads.selected = None
+                self.panel.set_selected(None)
+            if self.active():
+                self.ctl.clear_session()
         for index, key in enumerate(self.keys):
-            if key not in self.loads.running:
+            if key not in self.loads.running and key not in self.loads.cache:
                 self.panel.clear_done(index)
 
-    def fail(self, _gen: int, path: str, key: tuple, message: str) -> None:
-        if path != self.path:
+    def fail(self, _gen: int, path: str, key: tuple, message: str, *, run_id: int | None = None) -> None:
+        if path != self.path or not self.loads.is_current(key, run_id):
             return
         self.loads.abandon(key)
         if key not in self._index:
@@ -535,15 +650,37 @@ class PullBoard:
         self.panel.mark_error(self._index[key], message)
 
     def _drop_stale(self, path: str) -> None:
-        """Drop results for this log whose byte range is no longer a listed pull."""
+        """Drop results for this log whose identity is no longer a listed pull."""
 
         def gone(key: tuple) -> bool:
             return len(key) >= 2 and key[0] == "local" and key[1] == path and key not in self._index
 
         for key in [key for key in self.loads.cache if gone(key)]:
             del self.loads.cache[key]
-        self.loads.running.difference_update(key for key in self.loads.running if gone(key))
+        for key in [key for key in self.loads.running if gone(key)]:
+            self.loads.abandon(key)
         self.loads.order = [key for key in self.loads.order if not gone(key)]
+        if any(gone(key) for key in self.pinned):
+            self.pinned = {key for key in self.pinned if not gone(key)}
+            self._save_pins()
+
+    def _migrate_legacy_pins(self) -> None:
+        """Keep old range-only favorites, attaching the current fingerprint on first refresh."""
+        changed = False
+        for key in self.keys:
+            legacy = key[:4]
+            if len(key) == 5 and legacy in self.pinned:
+                self.pinned.remove(legacy)
+                self.pinned.add(key)
+                changed = True
+        if changed:
+            self._save_pins()
+
+    def _save_pins(self) -> None:
+        if self.settings is None:
+            return
+        tokens = [token for key in self.pinned if (token := pin_token(key))]
+        self.settings.setValue("pinned_local_pulls", tokens)
 
     def show_selected(self) -> None:
         """Show this card's cached pull again after the source switch comes back to local logs."""
@@ -555,9 +692,10 @@ class PullBoard:
         if selected not in self._index:
             if selected is not None or self.ctl.session is not None:
                 self.loads.selected = None
-                self.ctl.clear_session()
+                if self.active():
+                    self.ctl.clear_session()
             return
         self.panel.set_selected(self._index[selected])
         cached = self.loads.cache.get(selected)
-        if cached is not None and self.ctl.session is not cached:
+        if self.active() and cached is not None and self.ctl.session is not cached:
             self.ctl.set_session(cached)

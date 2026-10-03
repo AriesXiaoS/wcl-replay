@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
@@ -19,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..bosses.base import fmt_time
-from ..sources.local_log.index import DIFFICULTY_LABELS
+from ..core.difficulty import DIFFICULTY_LABELS
 from .controller import ReplayController
 from .log_panel import PullLoads, _PullRow
 
@@ -51,11 +53,12 @@ class WclPanel(QFrame):
     clearClicked = Signal()
     activated = Signal(int)
     removeRequested = Signal(int)
+    starToggled = Signal(int)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("logCard")
-        self.setMinimumWidth(280)
+        self.setMinimumWidth(340)
         self._rows: list[_PullRow] = []
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
@@ -128,9 +131,15 @@ class WclPanel(QFrame):
     def add_row(self, label: str) -> int:
         """Insert a row at the top. The click reports wherever that row sits when it is clicked."""
         stretch = self._list.takeAt(self._list.count() - 1)
-        row = _PullRow(label, self._body, action_tip="删除这条记录并释放内存")
+        row = _PullRow(
+            label,
+            self._body,
+            action_tip="删除这条记录并释放内存",
+            star_tip="收藏。清除缓存时会留下这场。",
+        )
         row.clicked.connect(lambda r=row: self.activated.emit(self._rows.index(r)))
         row.deleteClicked.connect(lambda r=row: self.removeRequested.emit(self._rows.index(r)))
+        row.starClicked.connect(lambda r=row: self.starToggled.emit(self._rows.index(r)))
         self._rows.insert(0, row)
         self._list.insertWidget(0, row)
         self._list.addItem(stretch)
@@ -174,13 +183,16 @@ class WclPanel(QFrame):
 class WclBoard:
     """In-memory list of WCL fights. A new query is inserted at the top."""
 
-    def __init__(self, ctl: ReplayController, panel: WclPanel):
+    def __init__(self, ctl: ReplayController, panel: WclPanel, active: Callable[[], bool] | None = None):
         self.ctl = ctl
         self.panel = panel
+        self.active = active or (lambda: True)
         self.loads = PullLoads()
+        self.pinned: set[tuple] = set()
         self.keys: list[tuple] = []
         self._seq = 0
         self.panel.removeRequested.connect(self.remove)
+        self.panel.starToggled.connect(self.toggle_pin)
 
     def begin(self, url: str) -> tuple[int, tuple]:
         """Insert a row at the top and mark it as the query that is about to run."""
@@ -188,50 +200,61 @@ class WclBoard:
         key = ("wcl", url, self._seq)
         index = self.panel.add_row(url)
         self.keys.insert(0, key)
-        self.loads.selected = key
-        self.loads.running.add(key)
+        self.loads.click(key)
         self.panel.set_selected(index)
         self.panel.show_progress(index, 0.0)
         self.panel.set_status(f"已记录 {len(self.keys)} 场")
         return index, key
 
     def activate(self, index: int) -> str:
-        """Show a finished fight. A row that is still querying just stays selected."""
+        """Show cached results, or restart a cleared/failed row."""
         key = self.keys[index]
         self.panel.set_selected(index)
-        if key in self.loads.cache:
-            self.loads.selected = key
+        action = self.loads.click(key)
+        if action == "show" and self.active():
             self.ctl.set_session(self.loads.cache[key])
-            return "show"
-        if key in self.loads.running:
-            self.loads.selected = key
-            return "wait"
-        return "idle"
+        elif action == "start":
+            self.panel.show_progress(index, 0.0)
+        return action
 
-    def note_progress(self, key: tuple, frac: float) -> None:
-        if key not in self.keys or key not in self.loads.running:
+    def note_progress(self, key: tuple, frac: float, *, run_id: int | None = None) -> None:
+        if key not in self.keys or not self.loads.is_current(key, run_id):
             return
         self.panel.show_progress(self.keys.index(key), frac)
 
-    def finish(self, key: tuple, session: object, label: str) -> bool:
+    def finish(self, key: tuple, session: object, label: str, *, run_id: int | None = None) -> bool:
+        if not self.loads.is_current(key, run_id):
+            return False
         if key not in self.keys:
             self.loads.abandon(key)
             return False
         index = self.keys.index(key)
         show = self.loads.complete(key, session)
+        show = show and self.active()
         self.panel.set_label(index, label)
         self.panel.mark_done(index)
         if show:
             self.ctl.set_session(session)
         return show
 
+    def toggle_pin(self, index: int) -> None:
+        if not 0 <= index < len(self.keys):
+            return
+        key = self.keys[index]
+        if key in self.pinned:
+            self.pinned.discard(key)
+        else:
+            self.pinned.add(key)
+        self.panel.rows[index].set_starred(key in self.pinned)
+
     def remove(self, index: int) -> None:
         """Drop one queried fight and release its computed result."""
         if not 0 <= index < len(self.keys):
             return
         key = self.keys.pop(index)
+        self.pinned.discard(key)
         session = self.loads.cache.pop(key, None)
-        self.loads.running.discard(key)
+        self.loads.abandon(key)
         if self.loads.selected == key:
             self.loads.selected = None
         if session is not None and self.ctl.session is session:
@@ -244,17 +267,21 @@ class WclBoard:
         self.panel.set_status(f"已记录 {len(self.keys)} 场" if self.keys else "输入一场战斗的链接")
 
     def clear_cache(self) -> None:
-        """Drop finished results. A fight that is still computing is left alone."""
-        self.loads.cache.clear()
-        if self.loads.selected not in self.loads.running:
-            self.loads.selected = None
-            self.panel.set_selected(None)
-        self.ctl.clear_session()
+        """Drop finished results. A pinned fight, and one that is still computing, stay."""
+        self.loads.cache = {key: session for key, session in self.loads.cache.items() if key in self.pinned}
+        if self.loads.selected not in self.loads.cache:
+            if self.loads.selected not in self.loads.running:
+                self.loads.selected = None
+                self.panel.set_selected(None)
+            if self.active():
+                self.ctl.clear_session()
         for index, key in enumerate(self.keys):
-            if key not in self.loads.running:
+            if key not in self.loads.running and key not in self.loads.cache:
                 self.panel.clear_done(index)
 
-    def fail(self, key: tuple, message: str) -> None:
+    def fail(self, key: tuple, message: str, *, run_id: int | None = None) -> None:
+        if not self.loads.is_current(key, run_id):
+            return
         self.loads.abandon(key)
         if key not in self.keys:
             return
@@ -266,5 +293,5 @@ class WclBoard:
             return
         self.panel.set_selected(self.keys.index(key))
         cached = self.loads.cache.get(key)
-        if cached is not None:
+        if self.active() and cached is not None:
             self.ctl.set_session(cached)

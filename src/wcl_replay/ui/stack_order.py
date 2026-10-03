@@ -27,8 +27,8 @@ def stack_group(analysis, aid: int) -> str:
     if aid in boss_ids_of(analysis):
         return "boss"
     style = analysis.unit_styles.get(aid)
-    if style is not None and style.group == "ghost":
-        return "ghost"
+    if style is not None and style.group:
+        return style.group
     npc_id = actor.npc_id if actor is not None else None
     return f"npc:{npc_id}" if npc_id is not None else "npc:?"
 
@@ -44,16 +44,17 @@ def present_stack_groups(analysis) -> list[tuple[str, str]]:
         found["boss"] = "Boss"
     hidden = set(getattr(analysis, "hidden_npc_ids", ()))
     for style in analysis.unit_styles.values():
-        if style.group == "ghost":
-            found["ghost"] = "魂"
-            break
+        if style.group:
+            found.setdefault(
+                style.group, "魂" if style.group == "ghost" else style.group_label or style.group
+            )
     for actor in actors:
         if actor.kind is not ActorKind.NPC or not actor.hostile or actor.npc_id is None:
             continue
         if actor.id in bosses or actor.npc_id in hidden:
             continue
         style = analysis.unit_styles.get(actor.id)
-        if style is not None and style.group == "ghost":
+        if style is not None and style.group:
             continue
         found.setdefault(f"npc:{actor.npc_id}", actor.name)
     for group, label in getattr(analysis, "stack_extras", ()):

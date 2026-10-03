@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import gzip
 import hashlib
 import json
 import time
@@ -14,11 +13,11 @@ from dataclasses import dataclass
 
 import httpx
 
+from ...core.cancellation import check_cancelled
 from ...core.models import Fight, FightData
-from ..local_log.index import cache_dir
+from ...storage import cache_dir, cache_warning, write_json
 from .convert import convert, fight_from_meta, pull_numbers
-
-CACHE_VERSION = 1
+from .urls import normalize_host
 
 REPORT_QUERY = """
 query($code: String!) {
@@ -36,20 +35,6 @@ query($code: String!) {
       masterData {
         actors { id name type subType icon petOwner gameID server }
         abilities { gameID name }
-      }
-    }
-  }
-}
-"""
-
-EVENTS_QUERY = """
-query($code: String!, $fight: [Int]!, $start: Float!, $end: Float!, $hostility: HostilityType!) {
-  reportData {
-    report(code: $code) {
-      events(fightIDs: $fight, startTime: $start, endTime: $end, hostilityType: $hostility,
-             includeResources: true, limit: 10000) {
-        data
-        nextPageTimestamp
       }
     }
   }
@@ -82,7 +67,7 @@ def parse_rate_limit(data: dict) -> tuple[float, int, int]:
     )
 
 
-@dataclass
+@dataclass(slots=True)
 class ReportInfo:
     code: str
     title: str
@@ -98,10 +83,13 @@ class WclClient:
             raise WclError("未配置 WCL API 的 Client ID / Secret（工具栏 → WCL API 设置…）")
         self.client_id = client_id
         self.client_secret = client_secret
-        self.host = host or "www.warcraftlogs.com"
+        self.host = normalize_host(host or "www.warcraftlogs.com")
         self.http = httpx.Client(timeout=timeout, headers={"User-Agent": "wcl-replay/0.1"})
         self._token: tuple[str, float] | None = None
         self._reports: dict[str, tuple[float, dict]] = {}
+
+    def close(self) -> None:
+        self.http.close()
 
     # -- auth / transport ---------------------------------------------------------------------
 
@@ -110,17 +98,23 @@ class WclClient:
         return cache_dir() / "wcl" / f"token-{key}.json"
 
     def token(self, force: bool = False) -> str:
+        check_cancelled()
         now = time.time()
         if not force and self._token and self._token[1] > now + 60:
             return self._token[0]
         path = self._token_file()
-        if not force and path.exists():
+        if not force:
             try:
                 tok = json.loads(path.read_text("utf-8"))
-                if tok["expires_at"] > now + 60:
+                if (
+                    isinstance(tok, dict)
+                    and isinstance(tok.get("access_token"), str)
+                    and isinstance(tok.get("expires_at"), (int, float))
+                    and tok["expires_at"] > now + 60
+                ):
                     self._token = (tok["access_token"], tok["expires_at"])
                     return tok["access_token"]
-            except (ValueError, KeyError):
+            except (OSError, ValueError, KeyError, TypeError):
                 pass
         try:
             r = self.http.post(
@@ -135,17 +129,22 @@ class WclClient:
         r.raise_for_status()
         body = r.json()
         self._token = (body["access_token"], now + float(body.get("expires_in", 3600)))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"access_token": self._token[0], "expires_at": self._token[1]}), "utf-8")
+        try:
+            write_json(path, {"access_token": self._token[0], "expires_at": self._token[1]})
+        except OSError as exc:
+            cache_warning(exc)
         return self._token[0]
 
     def query(self, q: str, variables: dict) -> dict:
         for attempt in range(2):
+            check_cancelled()
+            access_token = self.token(force=attempt > 0)
+            check_cancelled()
             try:
                 r = self.http.post(
                     f"https://{self.host}/api/v2/client",
                     json={"query": q, "variables": variables},
-                    headers={"Authorization": f"Bearer {self.token(force=attempt > 0)}"},
+                    headers={"Authorization": f"Bearer {access_token}"},
                 )
             except httpx.HTTPError as exc:
                 raise WclError(f"WCL 请求失败：{exc}") from exc
@@ -156,6 +155,7 @@ class WclClient:
             if r.status_code >= 400:
                 raise WclError(f"WCL API 错误 {r.status_code}: {r.text[:300]}")
             body = r.json()
+            check_cancelled()
             if body.get("errors"):
                 raise WclError(
                     "WCL GraphQL 错误：" + "; ".join(e.get("message", "?") for e in body["errors"])
@@ -187,40 +187,13 @@ class WclClient:
     def events(
         self, code: str, fight: dict, progress: Callable[[float, str], None] | None = None
     ) -> list[dict]:
-        start, end = float(fight["startTime"]), float(fight["endTime"])
-        span = max(1.0, end - start)
-        out: list[dict] = []
-        seen: set[str] = set()
-        views = ("Friendlies", "Enemies")
-        for vi, view in enumerate(views):
-            cursor: float | None = start
-            while cursor is not None:
-                data = self.query(
-                    EVENTS_QUERY,
-                    {
-                        "code": code,
-                        "fight": [int(fight["id"])],
-                        "start": cursor,
-                        "end": end,
-                        "hostility": view,
-                    },
-                )
-                page = data["reportData"]["report"]["events"]
-                for ev in page.get("data") or []:
-                    key = json.dumps(ev, sort_keys=True)
-                    if key not in seen:
-                        seen.add(key)
-                        out.append(ev)
-                nxt = page.get("nextPageTimestamp")
-                cursor = float(nxt) if nxt is not None and nxt > cursor else None
-                if progress:
-                    done = ((cursor if cursor is not None else end) - start) / span
-                    progress(
-                        (vi + done) / len(views),
-                        f"下载事件（{'友方' if vi == 0 else '敌方'}视角）… {len(out)} 条",
-                    )
-        out.sort(key=lambda ev: ev.get("timestamp", 0))
-        return out
+        from ...bosses.base import WclSlice
+        from .events import download
+
+        slices = tuple(
+            WclSlice(view, "All", hostility=view, resources=True) for view in ("Friendlies", "Enemies")
+        )
+        return download(self, code, fight, slices, progress=progress)
 
     def fight_data(
         self, code: str, fight_id: int, progress: Callable[[float, str], None] | None = None
@@ -229,22 +202,12 @@ class WclClient:
         fight = next((f for f in rep.get("fights") or [] if int(f["id"]) == fight_id), None)
         if fight is None:
             raise WclError(f"报告 {code} 中没有 fight {fight_id}")
-        path = cache_dir() / "wcl" / f"{code}-{fight_id}.json.gz"
-        events = None
-        if path.exists():
-            try:
-                with gzip.open(path, "rt", encoding="utf-8") as fh:
-                    blob = json.load(fh)
-                if blob.get("version") == CACHE_VERSION and blob.get("endTime") == fight.get("endTime"):
-                    events = blob["events"]
-                    if progress:
-                        progress(1.0, "使用本地缓存")
-            except (OSError, ValueError, KeyError):
-                events = None
-        if events is None:
-            events = self.events(code, fight, progress)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with gzip.open(path, "wt", encoding="utf-8") as fh:
-                json.dump({"version": CACHE_VERSION, "endTime": fight.get("endTime"), "events": events}, fh)
+        from ...bosses.base import WclSlice
+        from .events import cached_events
+
+        slices = tuple(
+            WclSlice(view, "All", hostility=view, resources=True) for view in ("Friendlies", "Enemies")
+        )
+        events = cached_events(self, self.host, code, fight, slices, progress=progress)
         pulls = pull_numbers(rep.get("fights") or [])
         return convert(rep, fight, events, pulls.get(fight_id, 0), source=f"wcl:{code}#{fight_id}")

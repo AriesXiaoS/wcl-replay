@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..bosses.base import fmt_time
-from ..sources.local_log.index import DIFFICULTY_LABELS
+from ..core.difficulty import DIFFICULTY_LABELS
 from ..sources.wcl_api.fetch import report_host
 from ..sources.wcl_api.urls import parse_report_url
 from ..workers import analyze_pull_job, fetch_wcl_job, index_log_job, rate_limit_job
@@ -36,7 +36,7 @@ from .loader import TaskRunner
 from .log_panel import LogPanel, PullBoard, short_error
 from .map_view import MapView
 from .panels import EventLogPanel, StatusPanel
-from .playback import GhostSpeedBar, PlaybackBar
+from .playback import AnalysisParameterBar, PlaybackBar
 from .raid_frames import AuraFilter, RaidFrames
 from .settings_dialog import SettingsDialog, cached_limit
 from .stack_panel import UnitStackPanel
@@ -51,23 +51,31 @@ DEFAULT_LOG_DIRS = (
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
         self.setWindowTitle(f"WCL Replay {__version__} · 战斗复盘")
         self.resize(1680, 980)
         self.statusBar().hide()
-        self.settings = QSettings("wcl_replay", "wcl_replay")
+        self.settings = settings if settings is not None else QSettings("wcl_replay", "wcl_replay")
         self._quota_gen = 0
-        self.ctl = ReplayController(self)
+        self._index_job = None
+        self._quota_job = None
+        self.ctl = ReplayController(self, settings=self.settings)
         self.tasks = TaskRunner(self)
         self.log_panel = LogPanel()
-        self.board = PullBoard(self.ctl, self.log_panel, limit=lambda: cached_limit(self.settings))
+        self.board = PullBoard(
+            self.ctl,
+            self.log_panel,
+            limit=lambda: cached_limit(self.settings),
+            settings=self.settings,
+            active=lambda: self.ctl.active_source == "local",
+        )
         self.log_panel.openClicked.connect(self.open_log_dialog)
         self.log_panel.refreshClicked.connect(self.reload_log)
         self.log_panel.clearClicked.connect(self.board.clear_cache)
         self.log_panel.activated.connect(self._on_activated)
         self.wcl_panel = WclPanel()
-        self.wcl_board = WclBoard(self.ctl, self.wcl_panel)
+        self.wcl_board = WclBoard(self.ctl, self.wcl_panel, active=lambda: self.ctl.active_source == "wcl")
         self.wcl_panel.queryRequested.connect(self.query_wcl)
         self.wcl_panel.settingsRequested.connect(self.edit_wcl_credentials)
         self.wcl_panel.clearClicked.connect(self.wcl_board.clear_cache)
@@ -91,7 +99,8 @@ class MainWindow(QMainWindow):
         lv.addWidget(self.map_view, 1)
         self.stack_panel = UnitStackPanel(self.ctl, self.settings, self.map_view)
         lv.addWidget(PlaybackBar(self.ctl))
-        lv.addWidget(GhostSpeedBar(self.ctl, self.settings))
+        self.parameter_bar = AnalysisParameterBar(self.ctl)
+        lv.addWidget(self.parameter_bar)
         lv.addWidget(TimelineWidget(self.ctl))
 
         self.aura_filter = AuraFilter(self.ctl, self.settings)
@@ -100,7 +109,8 @@ class MainWindow(QMainWindow):
         middle = QSplitter(Qt.Orientation.Vertical)
         middle.addWidget(self.raid_frames)
         middle.addWidget(self.aura_filter)
-        middle.addWidget(StatusPanel(self.ctl))
+        self.status_panel = StatusPanel(self.ctl)
+        middle.addWidget(self.status_panel)
         middle.addWidget(EventLogPanel(self.ctl))
         middle.setStretchFactor(0, 0)
         middle.setStretchFactor(1, 0)
@@ -117,12 +127,18 @@ class MainWindow(QMainWindow):
         source_lay.setSpacing(6)
         source_lay.addWidget(self._mode_switch())
         source_lay.addWidget(self._source, 1)
+        source_column.setMinimumWidth(340)
+        middle.setMinimumWidth(320)
 
         split = QSplitter(Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
         split.addWidget(source_column)
         split.addWidget(left)
         split.addWidget(middle)
-        split.setSizes([300, 980, 400])
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setStretchFactor(2, 0)
+        split.setSizes([360, 920, 400])
         shell = QWidget()
         shell_lay = QVBoxLayout(shell)
         shell_lay.setContentsMargins(4, 4, 4, 4)
@@ -132,7 +148,7 @@ class MainWindow(QMainWindow):
         self.ctl.sessionChanged.connect(self._update_title)
         if str(self.settings.value("source_mode", "local") or "local") == "wcl":
             self._wcl_mode.setChecked(True)
-            self._source.setCurrentWidget(self.wcl_panel)
+            self._set_source("wcl")
 
     def _mode_switch(self) -> QWidget:
         bar = QWidget()
@@ -165,6 +181,7 @@ class MainWindow(QMainWindow):
             self.board.trim_to_limit()
 
     def _set_source(self, mode: str) -> None:
+        self.ctl.set_source(mode)
         self.settings.setValue("source_mode", mode)
         self._source.setCurrentWidget(self.wcl_panel if mode == "wcl" else self.log_panel)
         if mode == "local":
@@ -197,10 +214,12 @@ class MainWindow(QMainWindow):
             self.open_log(self.board.path, source="refresh")
 
     def open_log(self, path: str, source: str = "open") -> None:
+        if self._index_job is not None:
+            self._index_job.cancel()
         self.settings.setValue("last_log", path)
         gen = self.board.prepare(path, source)
 
-        self.tasks.run(
+        self._index_job = self.tasks.run(
             index_log_job,
             (path,),
             lambda entries, g=gen: self._on_indexed(g, path, entries),
@@ -217,9 +236,9 @@ class MainWindow(QMainWindow):
     def _on_indexed(self, gen: int, path: str, entries: list) -> None:
         self.board.show_entries(gen, path, entries)
 
-    def _on_pull(self, gen: int, path: str, key: tuple, result: tuple) -> None:
+    def _on_pull(self, gen: int, path: str, key: tuple, result: tuple, *, run_id: int | None = None) -> None:
         data, tracks, analysis = result
-        self.board.finish(gen, path, key, Session(data, tracks, analysis))
+        self.board.finish(gen, path, key, Session(data, tracks, analysis), run_id=run_id)
 
     def _stored_credentials(self) -> tuple[str, str, str] | None:
         client_id = str(self.settings.value("wcl_client_id", "") or "").strip()
@@ -235,14 +254,20 @@ class MainWindow(QMainWindow):
         stored = self._stored_credentials()
         if stored is not None:
             return stored
-        if CredentialsDialog(self.settings, self).exec() != CredentialsDialog.DialogCode.Accepted:
+        if (
+            CredentialsDialog(self.settings, self, runner=self.tasks).exec()
+            != CredentialsDialog.DialogCode.Accepted
+        ):
             return None
         return self._stored_credentials()
 
     def edit_wcl_credentials(self) -> None:
-        CredentialsDialog(self.settings, self).exec()
+        CredentialsDialog(self.settings, self, runner=self.tasks).exec()
 
     def _refresh_wcl_quota(self) -> None:
+        if self._quota_job is not None:
+            self._quota_job.cancel()
+            self._quota_job = None
         creds = self._stored_credentials()
         self._quota_gen += 1
         gen = self._quota_gen
@@ -252,7 +277,7 @@ class MainWindow(QMainWindow):
         if self.wcl_panel.quota_lbl.text() in ("额度未刷新", "未设置 API", "额度读取失败"):
             self.wcl_panel.set_quota("正在读取额度…")
         client_id, secret, host = creds
-        self.tasks.run(
+        self._quota_job = self.tasks.run(
             rate_limit_job,
             (client_id, secret, host),
             lambda result, g=gen: self._on_quota(g, result),
@@ -287,23 +312,43 @@ class MainWindow(QMainWindow):
         client_id, secret, host = creds
         host = report_host(url) or host
         self.settings.setValue("wcl_last_url", url)
+        for index, existing in enumerate(self.wcl_board.keys):
+            if existing[1] == url and existing in self.wcl_board.loads.running:
+                self.wcl_board.activate(index)
+                self.wcl_panel.set_status("这场战斗正在下载，已选中现有任务")
+                return
         _index, key = self.wcl_board.begin(url)
-        self.tasks.run(
-            fetch_wcl_job,
-            (url, client_id, secret, host),
-            lambda result, k=key: self._on_wcl(k, result),
-            lambda tb, k=key: (self.wcl_board.fail(k, short_error(tb)), self._refresh_wcl_quota()),
-            lambda frac, _msg, k=key: self.wcl_board.note_progress(k, frac),
-        )
+        self._start_wcl(key, client_id, secret, host)
 
-    def _on_wcl(self, key: tuple, result: tuple) -> None:
+    def _start_wcl(self, key: tuple, client_id: str, secret: str, host: str) -> None:
+        run_id = self.wcl_board.loads.run_id(key)
+        handle = self.tasks.run(
+            fetch_wcl_job,
+            (key[1], client_id, secret, host),
+            lambda result, k=key, r=run_id: self._on_wcl(k, result, run_id=r),
+            lambda tb, k=key, r=run_id: (
+                self.wcl_board.fail(k, short_error(tb), run_id=r),
+                self._refresh_wcl_quota(),
+            ),
+            lambda frac, _msg, k=key, r=run_id: self.wcl_board.note_progress(k, frac, run_id=r),
+        )
+        self.wcl_board.loads.bind(key, handle)
+
+    def _on_wcl(self, key: tuple, result: tuple, *, run_id: int | None = None) -> None:
         data, tracks, analysis = result
         session = Session(data, tracks, analysis)
-        self.wcl_board.finish(key, session, fight_label(session))
+        self.wcl_board.finish(key, session, fight_label(session), run_id=run_id)
         self._refresh_wcl_quota()
 
     def _on_wcl_activated(self, index: int) -> None:
-        self.wcl_board.activate(index)
+        if self.wcl_board.activate(index) == "start":
+            key = self.wcl_board.keys[index]
+            creds = self._credentials()
+            if creds is None:
+                self.wcl_board.fail(key, "未设置 API 凭证")
+                return
+            client_id, secret, host = creds
+            self._start_wcl(key, client_id, secret, report_host(key[1]) or host)
 
     def _on_activated(self, index: int) -> None:
         action = self.board.activate(index)
@@ -313,14 +358,18 @@ class MainWindow(QMainWindow):
         path = self.board.path
         entry = self.board.entries[index]
         key = self.board.keys[index]
+        run_id = self.board.loads.run_id(key)
 
-        self.tasks.run(
+        handle = self.tasks.run(
             analyze_pull_job,
             (path, entry),
-            lambda result, g=gen, p=path, k=key: self._on_pull(g, p, k, result),
-            lambda tb, g=gen, p=path, k=key: self.board.fail(g, p, k, short_error(tb)),
-            lambda frac, _msg, g=gen, p=path, k=key: self.board.note_progress(g, p, k, frac),
+            lambda result, g=gen, p=path, k=key, r=run_id: self._on_pull(g, p, k, result, run_id=r),
+            lambda tb, g=gen, p=path, k=key, r=run_id: self.board.fail(g, p, k, short_error(tb), run_id=r),
+            lambda frac, _msg, g=gen, p=path, k=key, r=run_id: self.board.note_progress(
+                g, p, k, frac, run_id=r
+            ),
         )
+        self.board.loads.bind(key, handle)
 
     def _update_title(self) -> None:
         s = self.ctl.session

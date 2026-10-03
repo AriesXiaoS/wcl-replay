@@ -24,21 +24,18 @@ def _bar() -> tuple[QApplication, ReplayController, GhostSpeedBar]:
     return app, ctl, GhostSpeedBar(ctl, None)
 
 
-def test_typing_speed_and_angle_updates_the_sliders():
+def test_typing_speed_and_angle_applies_immediately():
     _app, ctl, bar = _bar()
     assert bar.speed_edit.text() == "3.0"
     assert bar.face_edit.text() == "22.5"
 
     bar.speed_edit.setText("3.2")
-    bar.speed_edit.editingFinished.emit()
     assert ctl.ghost_speed == 3.2
-    assert bar.slider.value() == 32
     assert bar.speed_edit.text() == "3.2"
 
     bar.face_edit.setText("±15.4°")
-    bar.face_edit.editingFinished.emit()
     assert ctl.ghost_face_deg == 15.4
-    assert bar.face_slider.value() == 154
+    bar.face_edit.editingFinished.emit()
     assert bar.face_edit.text() == "15.4"
 
     bar.speed_edit.setText("abc")
@@ -47,11 +44,10 @@ def test_typing_speed_and_angle_updates_the_sliders():
     assert bar.speed_edit.text() == "3.2"
 
     bar.face_edit.setText("120")
-    bar.face_edit.editingFinished.emit()
     assert ctl.ghost_face_deg == 90
     assert bar.face_edit.text() == "90.0"
 
-    bar.slider.setValue(18)
+    bar.speed_edit.setText("1.8")
     assert bar.speed_edit.text() == "1.8"
     assert ctl.ghost_speed == 1.8
 
@@ -71,23 +67,54 @@ def _wheel(slider, notches: int) -> None:
     )
 
 
-def test_mouse_wheel_steps_speed_and_angle_by_one():
+def test_mouse_wheel_steps_speed_and_angle():
     _app, ctl, bar = _bar()
-    speed_before = bar.slider.value()
-    face_before = bar.face_slider.value()
 
-    _wheel(bar.slider, 1)
-    assert bar.slider.value() == speed_before + 1
-    assert ctl.ghost_speed == (speed_before + 1) / 10
+    _wheel(bar.speed_edit, 1)
+    assert bar.speed_edit.text() == "3.1"
+    assert ctl.ghost_speed == 3.1
 
-    _wheel(bar.face_slider, 1)
-    assert bar.face_slider.value() == face_before + bar.face_slider.singleStep()
-    assert ctl.ghost_face_deg == (face_before / 10) + 1
+    _wheel(bar.face_edit, 1)
+    assert bar.face_edit.text() == "23.5"
+    assert ctl.ghost_face_deg == 23.5
 
-    _wheel(bar.slider, -1)
-    _wheel(bar.face_slider, -1)
-    assert bar.slider.value() == speed_before
-    assert bar.face_slider.value() == face_before
+    _wheel(bar.speed_edit, -1)
+    _wheel(bar.face_edit, -1)
+    assert bar.speed_edit.text() == "3.0"
+    assert ctl.ghost_speed == 3.0
+    assert bar.face_edit.text() == "22.5"
+    assert ctl.ghost_face_deg == 22.5
+
+
+def test_accel_mode_shows_its_three_parameters_and_the_note_sits_below():
+    _app, ctl, bar = _bar()
+    assert bar.mode.currentData() == "accel"
+    assert ctl.ghost_motion == "accel"
+    assert bar.accel_box.isVisibleTo(bar)
+    assert not bar.constant_box.isVisibleTo(bar)
+    assert bar.layout().itemAt(0).layout().itemAt(0).widget() is bar.mode
+    assert bar.layout().itemAt(1).widget() is bar.note
+    assert "仅供参考" in bar.note.text()
+    assert bar.start.edit.text() == "1.5"
+    assert bar.end.edit.text() == "3.0"
+    assert bar.accel.edit.text() == "0.5"
+
+    bar.start.edit.setText("1.4")
+    assert ctl.ghost_start_speed == 1.4
+    bar.end.edit.setText("4")
+    assert ctl.ghost_end_speed == 4.0
+    bar.accel.edit.setText("2.5")
+    assert ctl.ghost_accel_s == 2.5
+
+    bar.mode.setCurrentIndex(bar.mode.findData("constant"))
+    assert ctl.ghost_motion == "constant"
+    assert bar.constant_box.isVisibleTo(bar)
+    assert bar.pause.edit.isVisibleTo(bar)
+    assert ctl.ghost_speed == 3.0
+    assert bar.pause.edit.text() == "0.5"
+    assert ctl.ghost_pause_s == 0.5
+    bar.pause.edit.setText("0.8")
+    assert ctl.ghost_pause_s == 0.8
 
 
 def test_mouse_wheel_on_edits_steps_by_tenth_and_one_degree():
@@ -95,12 +122,10 @@ def test_mouse_wheel_on_edits_steps_by_tenth_and_one_degree():
 
     _wheel(bar.speed_edit, 1)
     assert bar.speed_edit.text() == "3.1"
-    assert bar.slider.value() == 31
     assert ctl.ghost_speed == 3.1
 
     _wheel(bar.face_edit, -1)
     assert bar.face_edit.text() == "21.5"
-    assert bar.face_slider.value() == 215
     assert ctl.ghost_face_deg == 21.5
 
     bar.speed_edit.setText("2")

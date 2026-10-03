@@ -169,7 +169,7 @@ def _aura_session(encounter_id: int = 3429):
     )
 
 
-def test_debuff_filter_starts_empty_and_remembers_a_multi_selection(tmp_path):
+def test_debuff_filter_starts_with_everything_and_remembers_a_selection(tmp_path):
     QApplication.instance() or QApplication([])
     settings = QSettings(str(tmp_path / "ui.ini"), QSettings.Format.IniFormat)
     ctl = ReplayController()
@@ -180,17 +180,21 @@ def test_debuff_filter_starts_empty_and_remembers_a_multi_selection(tmp_path):
     ctl.session = _aura_session()
     ctl.sessionChanged.emit()
     assert [box.text() for box in filt._boxes] == ["墓缚", "被魂盯"]
-    assert filt.selected_keys() == set()
-
-    filt._boxes[0].setChecked(True)
-    filt._boxes[1].setChecked(True)
     assert filt.selected_keys() == {"entombed", "fixate"}
     assert filt.summary.text() == "墓缚、被魂盯"
 
+    filt._boxes[0].setChecked(False)
+    assert filt.selected_keys() == {"fixate"}
     again = AuraFilter(ctl, settings)
-    assert again.selected_keys() == {"entombed", "fixate"}
+    assert again.selected_keys() == {"fixate"}
+
+    filt._boxes[1].setChecked(False)
+    assert filt.selected_keys() == set()
+    assert filt.summary.text() == "不显示"
+    cleared = AuraFilter(ctl, settings)
+    assert cleared.selected_keys() == set()
 
     ctl.session = _aura_session(encounter_id=1)
     ctl.sessionChanged.emit()
-    assert filt.selected_keys() == set()
-    assert filt.summary.text() == "不显示"
+    assert filt.selected_keys() == {"entombed", "fixate"}
+    assert filt.summary.text() == "墓缚、被魂盯"

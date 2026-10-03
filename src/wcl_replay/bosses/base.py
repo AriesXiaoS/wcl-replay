@@ -10,7 +10,8 @@ testable without Qt and new bosses never touch UI code. All positions are world 
 from __future__ import annotations
 
 import bisect
-from collections.abc import Callable
+import math
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import ClassVar
 
@@ -145,8 +146,9 @@ class UnitStyle:
     border: str = "#000000"
     show_facing: bool = False
     hp_bar: bool = False
-    group: str = ""  # "ghost" joins the 魂 stack; bosses and players are classified separately
+    group: str = ""  # Boss-owned stack group; bosses and players are classified separately.
     fill_alpha: float = 1.0
+    group_label: str = ""
 
 
 # ---------------------------------------------------------------------------- HUD / panels
@@ -288,16 +290,18 @@ def aura_intervals(
     spell_ids: set[int] | int,
     end_t: int | None = None,
     dst_filter: Callable[[int], bool] | None = None,
+    *,
+    source_independent: bool = False,
 ) -> Intervals:
-    """Applied -> removed intervals of auras (per destination unit)."""
+    """Applied -> removed auras; opt into source identity for independently applied instances."""
     ids = {spell_ids} if isinstance(spell_ids, int) else set(spell_ids)
     end_t = data.fight.duration_ms if end_t is None else end_t
-    open_: dict[tuple[int, int], Interval] = {}
+    open_: dict[tuple[int, ...], Interval] = {}
     out: list[Interval] = []
     for e in data.events:
         if e.spell_id not in ids or (dst_filter and not dst_filter(e.dst)):
             continue
-        key = (e.dst, e.spell_id)
+        key = (e.dst, e.spell_id, e.src) if source_independent else (e.dst, e.spell_id)
         if e.type in ("SPELL_AURA_APPLIED", "SPELL_AURA_APPLIED_DOSE"):
             # A dose on an aura that is already open is just another stack. A dose with no
             # apply (WCL sometimes only emits the stack) still has to open the interval.
@@ -307,10 +311,15 @@ def aura_intervals(
                 out.append(open_.pop(key))
                 out[-1].end = e.t
             open_[key] = Interval(e.t, end_t, e.dst, e.src, e.spell_id)
-        elif e.type == "SPELL_AURA_REMOVED" and key in open_:
-            iv = open_.pop(key)
-            iv.end = e.t
-            out.append(iv)
+        elif e.type == "SPELL_AURA_REMOVED":
+            keys = [key] if key in open_ else []
+            if source_independent and e.src < 0:
+                # A source-less removal reports the target's aura cleared, not one known source.
+                keys = [candidate for candidate in open_ if candidate[:2] == (e.dst, e.spell_id)]
+            for removed in keys:
+                iv = open_.pop(removed)
+                iv.end = e.t
+                out.append(iv)
     out.extend(open_.values())
     return Intervals(out)
 
@@ -336,9 +345,54 @@ class FrameAura:
     label: str
     spells: tuple[tuple[int, str], ...]
     tip: str = ""
+    source_independent: bool = False
 
 
 # ---------------------------------------------------------------------------- analysis / module
+
+
+type ParameterValue = float | str
+
+
+@dataclass(slots=True, frozen=True)
+class AnalysisParameter:
+    """A boss-owned numeric or choice control; no Qt or UI callbacks belong in this description.
+
+    ``choices`` contains ``(value, label)`` pairs. Every ``visible_when`` pair must match for the
+    control to appear. An explicit ``settings_key`` preserves older settings; other parameters
+    are stored under the encounter id so two bosses can use the same local parameter id.
+    """
+
+    id: str
+    label: str
+    default: ParameterValue
+    minimum: float = 0.0
+    maximum: float = 100.0
+    choices: tuple[tuple[str, str], ...] = ()
+    tooltip: str = ""
+    visible_when: tuple[tuple[str, ParameterValue], ...] = ()
+    step: float = 0.1
+    decimals: int = 1
+    suffix: str = ""
+    prefix: str = ""
+    settings_key: str = ""
+
+    def normalize(self, value: object) -> ParameterValue:
+        if self.choices:
+            return str(value) if str(value) in {item[0] for item in self.choices} else self.default
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = float(self.default)
+        if not math.isfinite(number):
+            number = float(self.default)
+        return max(self.minimum, min(self.maximum, number))
+
+    def is_visible(self, values: Mapping[str, ParameterValue]) -> bool:
+        return all(values.get(key) == expected for key, expected in self.visible_when)
+
+    def storage_key(self, encounter_id: int) -> str:
+        return self.settings_key or f"analysis_parameters/{encounter_id}/{self.id}"
 
 
 class Analysis:
@@ -351,10 +405,15 @@ class Analysis:
     stack_extras: tuple[tuple[str, str], ...] = ()
     # Debuffs the raid frames offer in the filter. Empty until a boss lists them.
     frame_auras: ClassVar[tuple[FrameAura, ...]] = ()
+    parameters: ClassVar[tuple[AnalysisParameter, ...]] = ()
+    parameter_note: ClassVar[str] = ""
 
     def __init__(self, data: FightData, tracks: Tracks):
         self.data = data
         self.tracks = tracks
+        self.parameter_values = {
+            parameter.id: parameter.normalize(parameter.default) for parameter in self.parameters
+        }
         self.phases: list[Phase] = [Phase(0, "Fight", "P1")]
         self.lanes: list[Lane] = []
         self.log: list[LogEntry] = []
@@ -378,6 +437,18 @@ class Analysis:
 
     # -- defaults -----------------------------------------------------------------------------
 
+    def apply_parameters(self, values: Mapping[str, ParameterValue]) -> None:
+        """Apply a partial parameter update. Subclasses rebuild their derived data after this call."""
+        for parameter in self.parameters:
+            if parameter.id in values:
+                self.parameter_values[parameter.id] = parameter.normalize(values[parameter.id])
+
+    def refresh_indexes(self) -> None:
+        """Synchronize public result indexes after a parameter hook rebuilt the result."""
+        self.log.sort(key=lambda entry: entry.t)
+        self.phases.sort(key=lambda phase: phase.t)
+        self._index_frame_auras()
+
     @property
     def boss_ids(self) -> list[int]:
         """Actor ids treated as this encounter's bosses, in display order."""
@@ -400,23 +471,26 @@ class Analysis:
         return [
             Lane(
                 "deaths",
-                "Deaths",
+                "死亡",
                 "#c9c9c9",
                 [LaneItem(t, shape="diamond", label=A[aid].short_name) for t, aid in self._deaths],
-                help="Player deaths.",
+                help="玩家死亡。",
             )
         ]
 
     def default_log(self) -> list[LogEntry]:
         A = self.data.actors
-        out = []
+        out = [
+            LogEntry(0, [Seg("数据提示", "#e0a030", badge=True), Seg(f" {message}（{count} 条）")])
+            for message, count in self.data.diagnostics.items()
+        ]
         for t, aid in self._deaths:
             a = A[aid]
             out.append(
                 LogEntry(
                     t,
                     [
-                        Seg("Death", "#c9c9c9", badge=True),
+                        Seg("死亡", "#c9c9c9", badge=True),
                         Seg(" " + a.short_name, class_color(a.class_name), bold=True),
                     ],
                     "deaths",
@@ -437,6 +511,8 @@ class Analysis:
 
     def in_arena(self, x: float, y: float) -> bool:
         """World point on the encounter floor. No arena means the whole map is in play."""
+        if not math.isfinite(x) or not math.isfinite(y):
+            return False
         box = self.arena
         if box is None:
             return True
@@ -448,7 +524,12 @@ class Analysis:
         indexed: dict[str, Intervals] = {}
         for aura in self.frame_auras:
             spell_ids = {spell_id for spell_id, _icon in aura.spells}
-            indexed[aura.key] = aura_intervals(self.data, spell_ids, dst_filter=players.__contains__)
+            indexed[aura.key] = aura_intervals(
+                self.data,
+                spell_ids,
+                dst_filter=players.__contains__,
+                source_independent=aura.source_independent,
+            )
         self._frame_iv = indexed
 
     def active_frame_auras(self, actor_id: int, t: float) -> tuple[tuple[str, str], ...]:

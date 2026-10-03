@@ -32,6 +32,7 @@ class _CardColumn(QWidget):
         running = self._anims.pop(key, None)
         if running is not None:
             running.stop()
+            running.deleteLater()
         if duration <= 0 or card.pos() == pos:
             card.move(pos)
             return
@@ -44,18 +45,21 @@ class _CardColumn(QWidget):
         anim.finished.connect(
             lambda k=key, a=anim: self._anims.pop(k, None) if self._anims.get(k) is a else None
         )
+        anim.finished.connect(anim.deleteLater)
         anim.start()
 
     def stop(self, card: QWidget) -> None:
         running = self._anims.pop(id(card), None)
         if running is not None:
             running.stop()
+            running.deleteLater()
 
     def stop_all(self) -> None:
         running = list(self._anims.values())
         self._anims.clear()
         for anim in running:
             anim.stop()
+            anim.deleteLater()
 
     @property
     def sliding(self) -> bool:
@@ -80,6 +84,7 @@ class _StackCard(QFrame):
     def set_lifted(self, lifted: bool) -> None:
         if self._lift_anim is not None:
             self._lift_anim.stop()
+            self._lift_anim.deleteLater()
             self._lift_anim = None
         self.setProperty("lifted", lifted)
         self.style().unpolish(self)
@@ -98,6 +103,13 @@ class _StackCard(QFrame):
         anim.setEndValue(18.0)
         anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._lift_anim = anim
+
+        def finished() -> None:
+            if self._lift_anim is anim:
+                self._lift_anim = None
+            anim.deleteLater()
+
+        anim.finished.connect(finished)
         anim.start()
 
     def mousePressEvent(self, event) -> None:
@@ -144,6 +156,7 @@ class UnitStackPanel(QFrame):
         lay.addWidget(self._column)
         self._load()
         ctl.sessionChanged.connect(self.refresh)
+        ctl.analysisChanged.connect(self.refresh)
         ctl.unitOrderChanged.connect(self.refresh)
         if parent is not None:
             parent.installEventFilter(self)
@@ -239,6 +252,7 @@ class UnitStackPanel(QFrame):
         anim.setEndValue(target)
         anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         anim.finished.connect(self._on_drop_finished)
+        anim.finished.connect(anim.deleteLater)
         self._drop_anim = anim
         anim.start()
 
@@ -295,6 +309,7 @@ class UnitStackPanel(QFrame):
         self._drop_anim = None
         if anim is not None:
             anim.stop()
+            anim.deleteLater()
 
     def _rebuild(self, display: list[tuple[str, str]]) -> None:
         self._cancel_drag()

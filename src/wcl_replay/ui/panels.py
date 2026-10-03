@@ -65,6 +65,7 @@ class StatusPanel(QTextBrowser):
         self._timer.timeout.connect(self._render)
         ctl.timeChanged.connect(lambda _t: self._timer.start() if not self._timer.isActive() else None)
         ctl.sessionChanged.connect(self._render)
+        ctl.analysisChanged.connect(self._render)
         ctl.layersChanged.connect(self._render)
 
     def _render(self) -> None:
@@ -101,6 +102,7 @@ class EventLogPanel(QTextBrowser):
         self._key: tuple | None = None
         self._times: list[int] = []
         ctl.sessionChanged.connect(self._on_session)
+        ctl.analysisChanged.connect(self._on_session)
         ctl.timeChanged.connect(lambda _t: self._render())
         ctl.layersChanged.connect(lambda: self._render(force=True))
 

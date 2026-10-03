@@ -12,14 +12,16 @@ Reads WCL_ID and WCL_SECRET from .env in the repo root. The values are never pri
 from __future__ import annotations
 
 import argparse
-import json
+import math
 import statistics
 import sys
 import time
 from pathlib import Path
 
+from wcl_replay.bosses.base import WclSlice
 from wcl_replay.bosses.coiled_altar import constants as C
 from wcl_replay.sources.wcl_api.client import WclClient, WclError
+from wcl_replay.sources.wcl_api.events import download
 from wcl_replay.sources.wcl_api.urls import parse_report_url
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,15 +125,20 @@ query($code: String!, $fight: [Int]!, $start: Float!, $end: Float!, $kind: Event
 
 class Budget:
     def __init__(self, limit: int, spent: float, cap: float):
+        if not math.isfinite(cap) or cap <= 0:
+            raise ValueError("本次预算上限必须为有限正数")
         self.limit = limit
         self.spent = spent
         self.start = spent
         self.cap = cap
         self.calls = 0
+        self.initialized = limit > 0
+        self.total = 0.0
+        self.reset_at: float | None = None
 
     @property
     def used(self) -> float:
-        return self.spent - self.start
+        return self.total
 
     def over(self) -> bool:
         return self.used >= self.cap
@@ -157,19 +164,19 @@ def aura_filter() -> str:
 def note_points(budget: Budget, block: dict | None) -> None:
     if not block:
         return
+    spent = float(block["pointsSpentThisHour"])
+    now = time.monotonic()
+    if not budget.initialized:
+        budget.start = spent
+        budget.initialized = True
+    elif spent < budget.spent or (budget.reset_at is not None and now >= budget.reset_at):
+        budget.total += max(0.0, spent)
+    else:
+        budget.total += max(0.0, spent - budget.spent)
     budget.limit = int(block["limitPerHour"])
-    budget.spent = float(block["pointsSpentThisHour"])
-
-
-def dedupe(events: list[dict]) -> list[dict]:
-    seen: set[str] = set()
-    out: list[dict] = []
-    for ev in events:
-        key = json.dumps(ev, sort_keys=True, ensure_ascii=False)
-        if key not in seen:
-            seen.add(key)
-            out.append(ev)
-    return out
+    budget.spent = spent
+    if "pointsResetIn" in block:
+        budget.reset_at = now + float(block["pointsResetIn"])
 
 
 def owner_of(ev: dict) -> tuple[int, int] | None:
@@ -207,13 +214,13 @@ class Probe:
     def call(self, label: str, query: str, variables: dict) -> dict:
         if self.budget.over():
             raise WclError(f"已用点数达到本次上限 {self.budget.cap:.0f}，停止后续请求")
-        before = self.budget.spent
+        before = self.budget.used
         started = time.perf_counter()
         data = self.client.query(query, variables)
         elapsed = time.perf_counter() - started
         note_points(self.budget, data.get("rateLimitData"))
         self.budget.calls += 1
-        delta = self.budget.spent - before
+        delta = self.budget.used - before
         self.rows.append((label, 1, elapsed, delta))
         print(f"  {label:<22} {elapsed:6.2f}s   {delta:7.1f} 点   累计 {self.budget.used:.1f}", flush=True)
         return data
@@ -323,6 +330,8 @@ def main() -> None:
     )
     ap.add_argument("--max-points", type=float, default=1200.0)
     args = ap.parse_args()
+    if not math.isfinite(args.max_points) or args.max_points <= 0:
+        ap.error("--max-points 必须为有限正数")
     code, fight_id = parse_report_url(args.url)
     if fight_id is None:
         raise SystemExit("链接里没有 fight id")
@@ -335,8 +344,15 @@ def main() -> None:
         raise SystemExit("仓库根目录 .env 里需要 WCL_ID 和 WCL_SECRET")
 
     client = WclClient(client_id, client_secret, host=host, timeout=120.0)
+    try:
+        run_probe(client, code, fight_id, host, args.max_points)
+    finally:
+        client.close()
+
+
+def run_probe(client: WclClient, code: str, fight_id: int, host: str, max_points: float) -> None:
     print(f"报告 {code}  fight {fight_id}  主机 {host}", flush=True)
-    probe = Probe(client, Budget(0, 0.0, args.max_points))
+    probe = Probe(client, Budget(0, 0.0, max_points))
 
     meta = probe.call("报告元数据", META_QUERY, {"code": code})
     report = meta["reportData"]["report"]
@@ -351,7 +367,9 @@ def main() -> None:
         f"{'击杀' if fight.get('kill') else '灭团'}  {duration:.0f}s  玩家 {len(player_ids)}",
         flush=True,
     )
-    print(f"额度 {probe.budget.limit}/小时，查询前已用 {probe.budget.start:.1f}", flush=True)
+    print(
+        f"额度 {probe.budget.limit}/小时，首个响应基准 {probe.budget.start:.1f}（不含首请求成本）", flush=True
+    )
 
     expression = aura_filter()
     print("一次请求拿敌方施法、机制光环、死亡、召唤、打断", flush=True)
@@ -369,44 +387,26 @@ def main() -> None:
     fields = bundled["reportData"]["report"]
     collected: dict[str, list[dict]] = {}
     for name in ("casts", "debuffs", "buffs", "deaths", "summons", "interrupts"):
-        page = fields[name]
-        events = list(page.get("data") or [])
-        nxt = page.get("nextPageTimestamp")
-        pages = 1
-        cursor = float(nxt) if nxt is not None else None
-        while cursor is not None and cursor > float(fight["startTime"]):
-            kind = {
-                "casts": "Casts",
-                "debuffs": "Debuffs",
-                "buffs": "Buffs",
-                "deaths": "Deaths",
-                "summons": "Summons",
-                "interrupts": "Interrupts",
-            }[name]
-            data = probe.call(
-                f"{name}#{pages + 1}",
-                SLICE_QUERY,
-                {
-                    "code": code,
-                    "fight": [fight_id],
-                    "start": cursor,
-                    "end": float(fight["endTime"]),
-                    "kind": kind,
-                    "hostility": "Enemies" if name == "casts" else None,
-                    "resources": name == "casts",
-                    "filter": expression if name in ("debuffs", "buffs") else None,
-                },
-            )
-            extra = data["reportData"]["report"]["events"]
-            events.extend(extra.get("data") or [])
-            pages += 1
-            nxt = extra.get("nextPageTimestamp")
-            prev = cursor
-            cursor = float(nxt) if nxt is not None and float(nxt) > prev else None
-            if pages >= 40:
-                break
-        collected[name] = dedupe(events)
-        print(f"    {name:<12} {len(collected[name]):6d} 条 / {pages} 页", flush=True)
+        kind = {
+            "casts": "Casts",
+            "debuffs": "Debuffs",
+            "buffs": "Buffs",
+            "deaths": "Deaths",
+            "summons": "Summons",
+            "interrupts": "Interrupts",
+        }[name]
+        collected[name] = paginate_with_code(
+            probe,
+            code,
+            name,
+            kind,
+            fight,
+            hostility="Enemies" if name == "casts" else None,
+            resources=name == "casts",
+            expression=expression if name in ("debuffs", "buffs") else None,
+            first_page=fields[name],
+        )
+        print(f"    {name:<12} {len(collected[name]):6d} 条", flush=True)
 
     print("玩家走位：友方受到的伤害（坐标在目标身上）", flush=True)
     player_events = paginate_with_code(
@@ -473,41 +473,25 @@ def paginate_with_code(
     hostility: str | None = None,
     resources: bool = False,
     expression: str | None = None,
+    first_page: dict | None = None,
 ) -> list[dict]:
-    """Probe.paginate cannot see the report code; this wrapper closes over it."""
-    start = float(fight["startTime"])
-    end = float(fight["endTime"])
-    cursor: float | None = start
-    found: list[dict] = []
-    pages = 0
-    while cursor is not None:
-        data = probe.call(
-            f"{label}#{pages + 1}",
-            SLICE_QUERY,
-            {
-                "code": code,
-                "fight": [int(fight["id"])],
-                "start": cursor,
-                "end": end,
-                "kind": kind,
-                "hostility": hostility,
-                "resources": resources,
-                "filter": expression,
-            },
-        )
-        page = data["reportData"]["report"]["events"]
-        batch = page.get("data") or []
-        found.extend(batch)
-        pages += 1
-        nxt = page.get("nextPageTimestamp")
-        prev = cursor
-        cursor = float(nxt) if nxt is not None and float(nxt) > prev else None
-        if not batch:
-            break
-        if pages >= 40:
-            print(f"  {label} 超过 40 页，停下", flush=True)
-            break
-    return dedupe(found)
+    """Use the production paginator, with quota accounting at the transport boundary."""
+
+    class Metered:
+        pages = 0
+
+        def query(self, _query: str, variables: dict) -> dict:
+            self.pages += 1
+            if self.pages == 1 and first_page is not None:
+                return {"reportData": {"report": {"events": first_page}}}
+            return probe.call(f"{label}#{self.pages}", SLICE_QUERY, variables)
+
+    return download(
+        Metered(),
+        code,
+        fight,
+        (WclSlice(label, kind, hostility=hostility or "", resources=resources, filter=expression or ""),),
+    )
 
 
 if __name__ == "__main__":
