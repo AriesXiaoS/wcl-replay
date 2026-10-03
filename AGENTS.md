@@ -40,3 +40,7 @@ uv run python tools/pack_windows.py
 - 界面文案用简体中文。代码注释保持与周围文件一致。
 - ruff：行宽 110，目标 `py313`，规则 `E F W I UP B`，忽略 `E501`。测试在 `tests/`，共用夹具在 `tests/fixture_log.py` 与 `tests/conftest.py`。
 - WCL Client ID / Secret 存在 `QSettings("wcl_replay", "wcl_replay")`。不要把凭证、战斗日志或 API 缓存写进仓库。
+
+## Git 提交署名
+
+- Codex 参与编写或修改的提交，在提交说明末尾空一行后添加 `Co-authored-by: Codex <codex@openai.com>`，让 GitHub 识别共同作者。未参与的提交不添加此署名，保留实际提交作者。
