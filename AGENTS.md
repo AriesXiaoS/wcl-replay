@@ -40,6 +40,7 @@ uv run python tools/pack_windows.py
 - 界面文案用简体中文。代码注释保持与周围文件一致。
 - ruff：行宽 110，目标 `py313`，规则 `E F W I UP B`，忽略 `E501`。测试在 `tests/`，共用夹具在 `tests/fixture_log.py` 与 `tests/conftest.py`。
 - WCL Client ID / Secret 存在 `QSettings("wcl_replay", "wcl_replay")`。不要把凭证、战斗日志或 API 缓存写进仓库。
+- 代码审查、修复过程等临时记录保存在仓库外，不放入 `docs/`，不提交到 Git；`docs/` 保留使用、扩展等长期项目文档。
 
 ## Git 提交署名
 
