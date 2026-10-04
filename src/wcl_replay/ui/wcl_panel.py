@@ -1,7 +1,7 @@
 # Copyright (c) 2026 伐竹取道 (AriesXiao)
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
-"""WCL card: paste one fight URL, compute it, and keep every result in the list."""
+"""WCL card: paste one fight URL, compute it, and retain each fight's list entry."""
 
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ class _WclRow(_PullRow):
         parent: QWidget | None = None,
         *,
         action_tip: str = "删除这条记录并释放内存",
-        star_tip: str = "收藏。清除缓存时会留下这场。",
+        star_tip: str = "收藏。自动释放或清除缓存时会留下这场。",
     ):
         super().__init__(label, parent, action_tip=action_tip, star_tip=star_tip)
         lay = self.layout()
@@ -279,6 +279,9 @@ class WclPanel(QFrame):
     def clear_done(self, index: int) -> None:
         self._rows[index].clear_done()
 
+    def release_result(self, index: int) -> None:
+        self._rows[index].release_result()
+
     def remove_row(self, index: int) -> None:
         row = self._rows.pop(index)
         self._list.removeWidget(row)
@@ -292,10 +295,18 @@ class WclPanel(QFrame):
 class WclBoard:
     """In-memory list of WCL fights. A new query is inserted at the top."""
 
-    def __init__(self, ctl: ReplayController, panel: WclPanel, active: Callable[[], bool] | None = None):
+    def __init__(
+        self,
+        ctl: ReplayController,
+        panel: WclPanel,
+        active: Callable[[], bool] | None = None,
+        *,
+        limit: Callable[[], int] | None = None,
+    ):
         self.ctl = ctl
         self.panel = panel
         self.active = active or (lambda: True)
+        self._limit = limit or (lambda: 0)
         self.loads = PullLoads()
         self.pinned: set[tuple] = set()
         self.keys: list[tuple] = []
@@ -321,9 +332,12 @@ class WclBoard:
         self.panel.set_selected(index)
         action = self.loads.click(key)
         if action == "show" and self.active():
-            self.ctl.set_session(self.loads.cache[key])
+            cached = self.loads.cache[key]
+            if self.ctl.session is not cached:
+                self.ctl.set_session(cached)
         elif action == "start":
             self.panel.reset_progress(index)
+        self.trim_to_limit()
         return action
 
     def note_progress(self, key: tuple, frac: float, message: str = "", *, run_id: int | None = None) -> None:
@@ -345,7 +359,29 @@ class WclBoard:
         self.panel.mark_done(index)
         if show:
             self.ctl.set_session(session)
+        self.trim_to_limit()
         return show
+
+    def trim_to_limit(self) -> None:
+        """Release the oldest results, retaining rows, favorites and the current replay."""
+        try:
+            cap = max(0, int(self._limit()))
+        except (TypeError, ValueError):
+            cap = 0
+        if cap == 0:
+            return
+        for key in list(self.loads.order):
+            if len(self.loads.cache) <= cap:
+                break
+            if key in self.pinned or key in self.loads.running or key == self.loads.selected:
+                continue
+            cached = self.loads.cache.get(key)
+            if cached is None or self.ctl.session is cached:
+                continue
+            del self.loads.cache[key]
+            self.loads.forget_order(key)
+            if key in self.keys:
+                self.panel.release_result(self.keys.index(key))
 
     def toggle_pin(self, index: int) -> None:
         if not 0 <= index < len(self.keys):
@@ -356,6 +392,7 @@ class WclBoard:
         else:
             self.pinned.add(key)
         self.panel.rows[index].set_starred(key in self.pinned)
+        self.trim_to_limit()
 
     def remove(self, index: int) -> None:
         """Drop one queried fight and release its computed result."""
@@ -379,6 +416,9 @@ class WclBoard:
     def clear_cache(self) -> None:
         """Drop finished results. A pinned fight, and one that is still computing, stay."""
         self.loads.cache = {key: session for key, session in self.loads.cache.items() if key in self.pinned}
+        self.loads.order = [
+            key for key in self.loads.order if key in self.loads.running or key in self.loads.cache
+        ]
         if self.loads.selected not in self.loads.cache:
             if self.loads.selected not in self.loads.running:
                 self.loads.selected = None
@@ -403,5 +443,5 @@ class WclBoard:
             return
         self.panel.set_selected(self.keys.index(key))
         cached = self.loads.cache.get(key)
-        if self.active() and cached is not None:
+        if self.active() and cached is not None and self.ctl.session is not cached:
             self.ctl.set_session(cached)

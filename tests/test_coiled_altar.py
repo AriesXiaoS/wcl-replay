@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import math
+
+import pytest
 from fixture_log import (
     BOSS_GUID,
     DPS_GUID,
@@ -20,9 +23,10 @@ from wcl_replay.bosses import discover, module_for
 from wcl_replay.bosses.base import Circle, Cone, Dot, Line, Path, UnitTag, aura_intervals
 from wcl_replay.bosses.coiled_altar import CoiledAltar, CoiledAltarAnalysis
 from wcl_replay.bosses.coiled_altar import constants as C
+from wcl_replay.bosses.coiled_altar.common import angle_diff
 from wcl_replay.bosses.coiled_altar.p1 import globules_of
 from wcl_replay.core.models import Actor, ActorKind, Event, Fight, FightData, Sample
-from wcl_replay.core.tracks import Tracks
+from wcl_replay.core.tracks import Tracks, angle_to
 from wcl_replay.pipeline import analyze
 
 
@@ -99,17 +103,81 @@ def test_p1_outputs(fight_data):
     assert (20000, 0.0) in series and series[-1][1] == 1.0
 
 
+def test_cleave_aims_at_the_tank_when_logged_facing_points_elsewhere(fight_data):
+    boss = aid(fight_data, BOSS_GUID)
+    tank = aid(fight_data, TANK_GUID)
+    fight_data.events.append(Event(4000, "SWING_DAMAGE", src=boss, dst=tank))
+    fight_data.samples[boss].append(Sample(4500, 0.0, 0.0, math.pi, 100, 100))
+    tracks, an = analyze(fight_data)
+    assert isinstance(an, CoiledAltarAnalysis)
+    origin = tracks.position(boss, 6000)
+    dest = tracks.position(tank, 6000)
+    logged = tracks.pose(boss, 6000)
+    assert origin and dest and logged is not None
+    toward_tank = angle_to(origin, dest)
+    assert angle_diff(logged.facing, math.pi) < 0.01
+    aimed = an.facing_at(boss, 6000)
+    assert aimed is not None and angle_diff(aimed, toward_tank) < 0.01
+    cone = next(p for p in an.overlays_at(12000) if isinstance(p, Cone))
+    aimed = an.facing_at(boss, 12000)
+    assert aimed is not None and angle_diff(cone.direction, aimed) < 0.01
+    assert angle_diff(cone.direction, math.pi) > 1
+
+
 def test_later_phases_draw_their_own_cleave(fight_data):
     _tracks, an = analyze(fight_data)
     soul = [p for p in an.overlays_at(21500) if isinstance(p, Cone)]
     assert len(soul) == 1 and soul[0].radius == 45 and not soul[0].dashed
     assert soul[0].label.startswith("灵魂撕裂")
+    mal, tank = aid(fight_data, MAL_GUID), aid(fight_data, TANK_GUID)
+    origin, dest = _tracks.position(mal, 21500), _tracks.position(tank, 21500)
+    aimed = an.facing_at(mal, 21500)
+    assert origin and dest and aimed is not None
+    assert angle_diff(aimed, angle_to(origin, dest)) < 0.01
+    assert angle_diff(soul[0].direction, aimed) < 0.01
     blight = [p for p in an.overlays_at(27500) if isinstance(p, Cone)]
     assert len(blight) == 1 and blight[0].radius == 45 and not blight[0].dashed
     assert blight[0].label.startswith("凋零撕裂")
     assert any(h.text.startswith("凋零撕裂") for h in an.hud_at(27500))
     dots = [p for p in an.overlays_at(27500) if isinstance(p, Dot)]
     assert len(dots) == 2 and sum(d.glow for d in dots) == 1
+
+
+@pytest.mark.parametrize("spell_id", [C.SEVER, C.BLIGHTED_SEVER])
+def test_completed_frontals_keep_their_impact_geometry(spell_id):
+    data = FightData(
+        Fight(1, C.ENCOUNTER_ID, "盘卷祭坛", 16, 20, 20000, False),
+        {
+            0: Actor(0, "boss", "祖尔加", ActorKind.NPC, npc_id=C.NPC_ZULJAN, hostile=True),
+            1: Actor(1, "tank", "坦克", ActorKind.PLAYER),
+        },
+        [
+            Event(7000, "SPELL_CAST_START", src=0, spell_id=spell_id),
+            Event(10000, "SPELL_CAST_SUCCESS", src=0, dst=1, spell_id=spell_id),
+            Event(10000, "SPELL_AURA_APPLIED", src=0, dst=1, spell_id=C.SEVER_DEBUFF),
+        ],
+        {
+            0: [
+                Sample(9000, 0.0, 0.0, math.pi, 100, 100),
+                Sample(10000, 0.0, 0.0, math.pi, 100, 100),
+                Sample(10300, 5.0, 0.0, math.pi, 100, 100),
+            ],
+            1: [
+                Sample(9000, 0.0, 5.0, 0.0, 100, 100),
+                Sample(10000, 5.0, 0.0, 0.0, 100, 100),
+                Sample(10300, 0.0, 5.0, 0.0, 100, 100),
+            ],
+        },
+    )
+    _, analysis = analyze(data)
+    before = next(p for p in analysis.overlays_at(9000) if isinstance(p, Cone))
+    assert angle_diff(before.direction, math.pi / 2) < 0.01
+    impact = next(p for p in analysis.overlays_at(10000) if isinstance(p, Cone))
+    assert (impact.x, impact.y, impact.direction) == (0.0, 0.0, 0.0)
+    for t in (10300, 10599):
+        after = next(p for p in analysis.overlays_at(t) if isinstance(p, Cone))
+        assert (after.x, after.y, after.direction) == (impact.x, impact.y, impact.direction)
+    assert not any(isinstance(p, Cone) for p in analysis.overlays_at(10601))
 
 
 def test_platform_square_is_drawn_around_the_spawn(fight_data):

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from wcl_replay.core.models import Actor, ActorKind, Event, Fight, FightData
 from wcl_replay.core.targets import Targets
 
@@ -51,3 +53,21 @@ def test_swing_and_ranged_retarget():
     assert targets.at(DPS, 100) == BOSS
     assert targets.at(DPS, 200) == HEALER
     assert targets.at(BOSS, 200) is None
+
+
+@pytest.mark.parametrize(
+    "hit_type,miss_type", [("SWING_DAMAGE", "SWING_MISSED"), ("RANGE_DAMAGE", "RANGE_MISSED")]
+)
+def test_missed_attacks_retarget_without_periodic_damage_retargeting(hit_type, miss_type):
+    targets = _fight(
+        [
+            Event(100, hit_type, BOSS, HEALER, amount=400),
+            Event(200, miss_type, BOSS, DPS, extra="DODGE"),
+            Event(300, "SPELL_PERIODIC_DAMAGE", BOSS, HEALER, amount=10),
+            Event(400, "SPELL_PERIODIC_MISSED", BOSS, HEALER, extra="IMMUNE"),
+        ]
+    )
+    assert targets.at(BOSS, 100) == HEALER
+    assert targets.at(BOSS, 200) == DPS
+    assert targets.at(BOSS, 500) == DPS
+    assert targets.at(BOSS, 150) == HEALER

@@ -38,7 +38,7 @@ from .map_view import MapView
 from .panels import EventLogPanel, StatusPanel
 from .playback import AnalysisParameterBar, PlaybackBar
 from .raid_frames import AuraFilter, RaidFrames
-from .settings_dialog import SettingsDialog, cached_limit
+from .settings_dialog import SettingsDialog, cached_limit, cached_wcl_limit
 from .stack_panel import UnitStackPanel
 from .timeline import TimelineWidget
 from .wcl_dialogs import CredentialsDialog
@@ -76,7 +76,12 @@ class MainWindow(QMainWindow):
         self.log_panel.clearClicked.connect(self.board.clear_cache)
         self.log_panel.activated.connect(self._on_activated)
         self.wcl_panel = WclPanel()
-        self.wcl_board = WclBoard(self.ctl, self.wcl_panel, active=lambda: self.ctl.active_source == "wcl")
+        self.wcl_board = WclBoard(
+            self.ctl,
+            self.wcl_panel,
+            active=lambda: self.ctl.active_source == "wcl",
+            limit=lambda: cached_wcl_limit(self.settings),
+        )
         self.wcl_panel.queryRequested.connect(self.query_wcl)
         self.wcl_panel.settingsRequested.connect(self.edit_wcl_credentials)
         self.wcl_panel.clearClicked.connect(self.wcl_board.clear_cache)
@@ -177,6 +182,7 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         if SettingsDialog(self.settings, self).exec():
             self.board.trim_to_limit()
+            self.wcl_board.trim_to_limit()
 
     def _set_source(self, mode: str) -> None:
         self.ctl.set_source(mode)

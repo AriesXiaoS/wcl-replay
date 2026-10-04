@@ -25,12 +25,13 @@ from typing import BinaryIO
 from ...core.cancellation import check_cancelled
 from ...core.difficulty import DIFFICULTY_LABELS
 from ...core.markers import MarkerEvent, clip_world_markers
+from ...core.models import WorldMarker
 from ...storage import cache_dir as cache_dir
 from ...storage import cache_warning, write_json
 from .fields import split_fields
 from .timestamps import parse_ts_ms
 
-INDEX_VERSION = 8
+INDEX_VERSION = 9
 
 # Report progress through a long scan. One mmap.find over a multi-gigabyte log would not
 # publish a fraction until it returned.
@@ -57,6 +58,8 @@ class EncounterEntry:
     map_line: str | None = None
     content_digest: str = ""
     analysis_digest: str = ""
+    # None is only for manually constructed/legacy entries; an indexed empty snapshot is ().
+    marker_snapshot: tuple[WorldMarker, ...] | None = None
 
     @property
     def difficulty_label(self) -> str:
@@ -135,6 +138,13 @@ def _cache_file(path: Path) -> Path:
     return d / f"{key}.json"
 
 
+def _entry_from_cache(raw: dict) -> EncounterEntry:
+    snapshot = raw["marker_snapshot"]
+    if not isinstance(snapshot, list):
+        raise ValueError("索引缓存光柱快照错误")
+    return EncounterEntry(**(raw | {"marker_snapshot": tuple(WorldMarker(**marker) for marker in snapshot)}))
+
+
 def _read_cache(path: Path) -> dict:
     cached = json.loads(path.read_text("utf-8"))
     if not isinstance(cached, dict):
@@ -150,7 +160,7 @@ def _read_cache(path: Path) -> dict:
     if not isinstance(cached.get("entries"), list) or not isinstance(cached.get("markers"), list):
         raise ValueError("索引缓存列表错误")
     for raw in cached["entries"]:
-        entry = EncounterEntry(**raw)
+        entry = _entry_from_cache(raw)
         if (
             any(
                 type(getattr(entry, key)) is not int
@@ -178,6 +188,15 @@ def _read_cache(path: Path) -> dict:
         ):
             raise ValueError("索引缓存字段错误")
         parse_ts_ms(entry.start_ts)
+        for marker in entry.marker_snapshot or ():
+            if (
+                any(type(getattr(marker, key)) is not int for key in ("index", "start", "end"))
+                or not 0 <= marker.start < marker.end <= entry.duration_ms + 1
+                or not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (marker.x, marker.y))
+            ):
+                raise ValueError("索引缓存光柱快照字段错误")
+        if entry.analysis_digest != _analysis_digest(entry):
+            raise ValueError("索引缓存分析上下文错误")
     for raw in cached["markers"]:
         marker = MarkerEvent(**raw)
         if (
@@ -460,10 +479,13 @@ def _fight_duration(mm: mmap.mmap, entry: EncounterEntry) -> int:
     return duration
 
 
-def _analysis_digest(entry: EncounterEntry, markers: list[MarkerEvent]) -> str:
+def _analysis_digest(entry: EncounterEntry) -> str:
     """Identity of the pull bytes and the external map/marker context actually used by analysis."""
-    clipped = clip_world_markers(markers, parse_ts_ms(entry.start_ts), entry.duration_ms, entry.instance_id)
-    payload = [entry.content_digest, entry.map_line, [asdict(marker) for marker in clipped]]
+    payload = [
+        entry.content_digest,
+        entry.map_line,
+        [asdict(marker) for marker in entry.marker_snapshot or ()],
+    ]
     return hashlib.blake2b(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"), digest_size=16
     ).hexdigest()
@@ -489,7 +511,7 @@ def index_log(path: str | Path, progress: Callable[[float], None] | None = None)
         if cf.exists():
             cached = _read_cache(cf)
             if cached.get("version") == INDEX_VERSION and "markers" in cached:
-                old = [EncounterEntry(**e) for e in cached["entries"]]
+                old = [_entry_from_cache(e) for e in cached["entries"]]
                 if _metadata_matches(cached, st, change_time):
                     check_cancelled()
                     if progress:
@@ -550,7 +572,12 @@ def index_log(path: str | Path, progress: Callable[[float], None] | None = None)
                         entry.content_digest = hashlib.blake2b(
                             view[entry.start_offset : entry.end_offset], digest_size=16
                         ).hexdigest()
-                    entry.analysis_digest = _analysis_digest(entry, markers)
+                    entry.marker_snapshot = tuple(
+                        clip_world_markers(
+                            markers, parse_ts_ms(entry.start_ts), entry.duration_ms, entry.instance_id
+                        )
+                    )
+                    entry.analysis_digest = _analysis_digest(entry)
             finally:
                 view.release()
     for i, e in enumerate(entries, 1):

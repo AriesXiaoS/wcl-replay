@@ -19,7 +19,9 @@ _TARGET_EVENTS = frozenset(
         "SPELL_CAST_START",
         "SPELL_CAST_SUCCESS",
         "SWING_DAMAGE",
+        "SWING_MISSED",
         "RANGE_DAMAGE",
+        "RANGE_MISSED",
         "SPELL_HEAL",
     }
 )

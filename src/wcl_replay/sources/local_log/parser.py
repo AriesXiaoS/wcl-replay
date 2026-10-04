@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 from ...core.markers import clip_world_markers
@@ -306,12 +307,16 @@ def parse_encounter(
         pull_number=entry.pull_number,
         instance_id=entry.instance_id,
     )
-    markers = clip_world_markers(
-        marker_events(path),
-        parse_ts_ms(entry.start_ts),
-        fight.duration_ms,
-        entry.instance_id,
-    )
+    if entry.marker_snapshot is not None:
+        # Keep the indexed map/marker context together, even if the live log has since grown.
+        markers = [replace(marker) for marker in entry.marker_snapshot]
+    else:
+        markers = clip_world_markers(
+            marker_events(path),
+            parse_ts_ms(entry.start_ts),
+            fight.duration_ms,
+            entry.instance_id,
+        )
     return FightData(
         fight=fight,
         actors=b.actors,

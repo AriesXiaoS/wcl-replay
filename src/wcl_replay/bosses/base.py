@@ -545,6 +545,15 @@ class Analysis:
                     out.append((aura.key, icon))
         return tuple(out)
 
+    def facing_at(self, actor_id: int, t: float) -> float | None:
+        """Direction to draw for this unit, or None to keep the logged facing.
+
+        Logged facing on an incoming hit is not the way a boss is cleaving. A module
+        overrides this when the combat target is known.
+        """
+        del actor_id, t
+        return None
+
     def units_at(self, t: float) -> list[int]:
         """Non-player units to draw at time t."""
         return [aid for aid in self._npcs if self.tracks.present(aid, t) and not self.tracks.is_dead(aid, t)]

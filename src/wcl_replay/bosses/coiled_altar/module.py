@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import bisect
+import math
 from collections.abc import Mapping
 
 from ...core.models import FightData
-from ...core.tracks import Tracks
+from ...core.tracks import Tracks, angle_to
 from ..base import (
     Analysis,
     AnalysisParameter,
@@ -195,7 +197,60 @@ class CoiledAltarAnalysis(Analysis):
         self.unit_styles = self._styles()
         if self.p2:
             self._npcs += [g.aid for g in self.p2.ghosts if g.aid not in self._npcs]
+        self._index_melee()
         self.apply_parameters(parameters if parameters is not None else self.parameter_values)
+
+    def _index_melee(self) -> None:
+        """Boss auto-attacks. Incoming damage does not change who they are hitting."""
+        bosses = {self.p1.boss}
+        if self.p2 is not None:
+            bosses.add(self.p2.boss)
+        swings: dict[int, list[tuple[int, int]]] = {}
+        for event in self.data.events:
+            if event.type not in ("SWING_DAMAGE", "SWING_MISSED") or event.src not in bosses:
+                continue
+            actor = self.data.actors.get(event.dst)
+            if actor is None or not actor.is_player:
+                continue
+            swings.setdefault(event.src, []).append((event.t, event.dst))
+        self._melee_t: dict[int, list[int]] = {}
+        self._melee_dst: dict[int, list[int]] = {}
+        for aid, rows in swings.items():
+            rows.sort()
+            self._melee_t[aid] = [stamp for stamp, _dst in rows]
+            self._melee_dst[aid] = [dst for _stamp, dst in rows]
+
+    def _melee_at(self, actor_id: int, t: float) -> int | None:
+        stamps = self._melee_t.get(actor_id)
+        if not stamps:
+            return None
+        index = bisect.bisect_right(stamps, t) - 1
+        if index < 0:
+            return None
+        return self._melee_dst[actor_id][index]
+
+    def facing_at(self, actor_id: int, t: float) -> float | None:
+        """Point the boss at the tank they are cleaving, else the tank they are hitting.
+
+        A hit on the boss writes a facing sample that can sit 180° off that tank until the
+        cleave cast itself is logged. The cone already aims at the tank; the tick follows it.
+        """
+        target = None
+        if actor_id == self.p1.boss:
+            target = self.p1.cleave_target_at(t)
+        elif self.p2 is not None and actor_id == self.p2.boss:
+            target = self.p2.cleave_target_at(t)
+        if target is None:
+            target = self._melee_at(actor_id, t)
+        if target is None:
+            return None
+        origin = self.tracks.position(actor_id, t)
+        dest = self.tracks.position(target, t)
+        if origin is None or dest is None:
+            return None
+        if math.hypot(dest[0] - origin[0], dest[1] - origin[1]) < 0.05:
+            return None
+        return angle_to(origin, dest)
 
     def _p2_start(self) -> int | None:
         zul = {a.id for a in self.data.actors_by_npc(C.NPC_ZULJAN)}

@@ -155,3 +155,67 @@ def test_wcl_row_splits_download_and_compute_progress():
     assert row.download.host.isHidden() is True
     assert row.compute.host.isHidden() is True
     assert row.mark.text() == "✓"
+
+
+def test_wcl_limit_releases_results_keeps_rows_and_allows_reloading():
+    QApplication.instance() or QApplication([])
+    ctl, panel = ReplayController(), WclPanel()
+    board = WclBoard(ctl, panel, limit=lambda: 2)
+    keys = []
+    for number in range(3):
+        _, key = board.begin(f"synthetic-{number}")
+        keys.append(key)
+        assert board.finish(key, _session(), f"战斗 {number}")
+
+    oldest = keys[0]
+    assert set(board.loads.cache) == set(keys[1:])
+    assert len(panel.rows) == len(board.keys) == 3
+    assert panel.rows[2].mark.text() == ""
+    assert oldest not in board.loads.order
+    assert board.activate(2) == "start"
+    assert oldest in board.loads.running
+    assert not panel.rows[2].download.host.isHidden()
+    assert board.finish(oldest, _session(), "重新加载")
+    assert oldest in board.loads.cache
+    assert len(board.loads.cache) == 2
+
+
+def test_wcl_limit_preserves_the_current_replay_during_background_completion():
+    QApplication.instance() or QApplication([])
+    ctl, panel = ReplayController(), WclPanel()
+    board = WclBoard(ctl, panel, limit=lambda: 1)
+    _, first = board.begin("first")
+    visible = _session()
+    assert board.finish(first, visible, "正在回放")
+    ctl.t = 12_000
+    _, second = board.begin("second")
+    _, third = board.begin("third")
+
+    assert not board.finish(second, _session(), "后台完成")
+    assert ctl.session is visible and ctl.t == 12_000
+    assert set(board.loads.cache) == {first}
+    assert third in board.loads.running
+    assert panel.rows[1].mark.text() == ""
+    assert not panel.rows[0].download.host.isHidden()
+
+    assert board.finish(third, _session(), "当前选择")
+    assert set(board.loads.cache) == {third}
+
+
+def test_wcl_limit_keeps_favorites_and_trims_when_unpinned():
+    QApplication.instance() or QApplication([])
+    ctl, panel = ReplayController(), WclPanel()
+    board = WclBoard(ctl, panel, limit=lambda: 1)
+    _, favorite = board.begin("favorite")
+    board.finish(favorite, _session(), "收藏")
+    board.toggle_pin(0)
+    _, second = board.begin("second")
+    board.finish(second, _session(), "第二场")
+    _, newest = board.begin("newest")
+    board.finish(newest, _session(), "第三场")
+
+    assert set(board.loads.cache) == {favorite, newest}
+    assert panel.rows[2].star_btn.text() == "★"
+    board.toggle_pin(2)
+    assert set(board.loads.cache) == {newest}
+    assert len(board.keys) == 3

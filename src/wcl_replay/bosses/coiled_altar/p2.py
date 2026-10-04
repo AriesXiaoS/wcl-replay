@@ -284,6 +284,18 @@ class P2Model:
                 start = None
         return out
 
+    def cleave_target_at(self, t: float) -> int | None:
+        """Who the visible soul-sever cone is aimed at."""
+        active = [
+            (cs, st, tank)
+            for cs, st, tank, _n in self.soul_severs
+            if tank >= 0 and st - C.SEVER_PREVIEW_MS <= t <= st + 600
+        ]
+        if not active:
+            return None
+        active.sort(key=lambda row: (t < row[0], abs(row[1] - t)))
+        return active[0][2]
+
     def _fixate_ends(self) -> list[FixateEnd]:
         sever_ts = [t for _s, t, _tank, _n in self.soul_severs]
         out = []

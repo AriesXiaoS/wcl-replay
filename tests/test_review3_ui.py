@@ -10,7 +10,8 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QPointF
+from PySide6.QtCore import QPointF, Qt, QUrl
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import QApplication
 
 from wcl_replay.bosses.base import Analysis, Lane, LogEntry, Seg, UnitFlash
@@ -19,6 +20,7 @@ from wcl_replay.core.tracks import Tracks
 from wcl_replay.ui.controller import ReplayController, Session
 from wcl_replay.ui.map_view import MapView
 from wcl_replay.ui.panels import EventLogPanel
+from wcl_replay.ui.theme import PANEL_2, TEXT_DIM
 
 
 @pytest.fixture
@@ -162,6 +164,133 @@ def test_event_log_handles_no_visible_events_and_future_only_visible_events(app)
         assert panel.verticalScrollBar().value() == 0
         ctl.toggle_layer("events")
         assert "未来事件" in panel.toPlainText()
+    finally:
+        panel.deleteLater()
+        app.processEvents()
+
+
+def test_event_log_time_updates_keep_the_document_and_rebuild_only_for_content_changes(app, monkeypatch):
+    ctl = ReplayController()
+    panel = EventLogPanel(ctl)
+    session = _session()
+    session.analysis.log = [
+        LogEntry(i * 100, [Seg(f"事件 {i}")], "hidden" if i % 2 else "visible") for i in range(100)
+    ]
+    session.analysis.lanes = [Lane("visible", "显示", "#ffffff"), Lane("hidden", "隐藏", "#ffffff")]
+    rebuilt = []
+    set_html = panel.setHtml
+
+    def record_rebuild(text):
+        rebuilt.append(text)
+        set_html(text)
+
+    monkeypatch.setattr(panel, "setHtml", record_rebuild)
+    try:
+        ctl.set_session(session)
+        assert len(rebuilt) == 1
+        table = panel._table
+        revision = panel.document().revision()
+        text = panel.toPlainText()
+        for t in (100, 5100, 4900, 9900, 0):
+            ctl.seek(t)
+            assert panel._table is table
+            assert panel.document().revision() == revision
+            assert panel.toPlainText() == text
+        assert len(rebuilt) == 1
+
+        ctl.toggle_layer("hidden")
+        assert len(rebuilt) == 2
+        assert "事件 99" not in panel.toPlainText()
+        ctl.seek(7500)
+        assert len(rebuilt) == 2
+        assert "事件 98" in panel.toPlainText()
+
+        ctl.clear_session()
+        assert len(rebuilt) == 3
+        assert panel.toPlainText() == ""
+        assert panel._table is None
+        replacement = _session()
+        replacement.analysis.log = [LogEntry(8000, [Seg("新场次")])]
+        ctl.set_session(replacement)
+        assert len(rebuilt) == 4
+        assert "新场次" in panel.toPlainText()
+        assert "事件 98" not in panel.toPlainText()
+        replacement.analysis.log.append(LogEntry(9000, [Seg("追加事件")]))
+        ctl.analysisChanged.emit()
+        assert len(rebuilt) == 5
+        assert "追加事件" in panel.toPlainText()
+        ctl.seek(9500)
+        assert len(rebuilt) == 5
+    finally:
+        panel.deleteLater()
+        app.processEvents()
+
+
+def _timestamp_format(panel, row):
+    cursor = panel._table.cellAt(row, 0).firstCursorPosition()
+    cursor.movePosition(QTextCursor.MoveOperation.NextCharacter, QTextCursor.MoveMode.KeepAnchor)
+    return _paint_format(panel, cursor)
+
+
+def _paint_format(panel, cursor):
+    fmt = cursor.charFormat()
+    for mark in panel.extraSelections():
+        if mark.cursor.selectionStart() <= cursor.selectionStart() < mark.cursor.selectionEnd():
+            fmt.merge(mark.format)
+    return fmt
+
+
+def _cell_paint_format(panel, row, column):
+    cursor = panel._table.cellAt(row, column).firstCursorPosition()
+    cursor.movePosition(QTextCursor.MoveOperation.NextCharacter, QTextCursor.MoveMode.KeepAnchor)
+    return _paint_format(panel, cursor)
+
+
+def test_event_log_incremental_highlight_preserves_rich_text_and_time_links(app):
+    ctl = ReplayController()
+    panel = EventLogPanel(ctl)
+    session = _session()
+    session.analysis.log = [
+        LogEntry(
+            1000,
+            [Seg("标记", "#e0a030", badge=True), Seg(" 主事件", "#abcdef", bold=True)],
+            sub=[Seg("详情", "#fedcba")],
+        ),
+        LogEntry(4000, [Seg("后续事件")]),
+    ]
+    try:
+        ctl.set_session(session)
+        body_formats = {word: panel.document().find(word).charFormat() for word in ("标记", "主事件", "详情")}
+        future_color = _timestamp_format(panel, 0).foreground().color().name()
+        assert future_color != TEXT_DIM
+        assert body_formats["标记"].background().style() != Qt.BrushStyle.NoBrush
+        assert body_formats["主事件"].fontWeight() > body_formats["详情"].fontWeight()
+
+        ctl.seek(1500)
+        assert _timestamp_format(panel, 0).foreground().color().name() == TEXT_DIM
+        assert _timestamp_format(panel, 1).foreground().color().name() == future_color
+        assert _cell_paint_format(panel, 0, 0).background().color().name() == PANEL_2
+        assert _paint_format(panel, panel.document().find("主事件")).background().color().name() == PANEL_2
+        badge = _paint_format(panel, panel.document().find("标记"))
+        assert badge.background() == body_formats["标记"].background()
+        assert badge.foreground() == body_formats["标记"].foreground()
+
+        ctl.seek(4500)
+        assert _cell_paint_format(panel, 0, 0).background().style() == Qt.BrushStyle.NoBrush
+        assert _cell_paint_format(panel, 1, 0).background().color().name() == PANEL_2
+        assert _timestamp_format(panel, 1).foreground().color().name() == TEXT_DIM
+        ctl.seek(500)
+        for row in (0, 1):
+            assert _cell_paint_format(panel, row, 0).background().style() == Qt.BrushStyle.NoBrush
+            assert _timestamp_format(panel, row).foreground().color().name() == future_color
+        for word, fmt in body_formats.items():
+            assert panel.document().find(word).charFormat() == fmt
+            assert fmt.anchorHref() == "t:1000"
+        assert _timestamp_format(panel, 0).anchorHref() == "t:1000"
+        assert _timestamp_format(panel, 1).anchorHref() == "t:4000"
+        panel.anchorClicked.emit(QUrl("t:4000"))
+        assert ctl.t == 4000
+        assert not panel.document().isUndoAvailable()
     finally:
         panel.deleteLater()
         app.processEvents()

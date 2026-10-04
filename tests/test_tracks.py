@@ -39,10 +39,68 @@ def test_facing_interpolation_takes_the_short_arc():
     assert math.isclose(mid, 0.0, abs_tol=1e-9)
 
 
+def test_npc_facing_holds_and_a_death_does_not_slide_into_the_next_life():
+    boss = Actor(0, "Creature-0-0-0-0-1-1", "首领", ActorKind.NPC, npc_id=1, hostile=True)
+    data = FightData(
+        Fight(1, 1, "x", 16, 20, 20000, False),
+        {0: boss},
+        [Event(5000, "UNIT_DIED", dst=0)],
+        {
+            0: [
+                Sample(0, 0.0, 0.0, 0.0, 100, 100),
+                Sample(4000, 10.0, 0.0, 1.0, 80, 100),
+                Sample(5100, 10.0, 0.0, 1.0, 1, 100),
+                Sample(12000, 40.0, 8.0, 2.0, 90, 100),
+                Sample(16000, 50.0, 8.0, 2.5, 70, 100),
+            ]
+        },
+    )
+    tracks = Tracks(data)
+    mid = tracks.pose(0, 2000)
+    assert mid is not None and mid.x == 5.0 and mid.y == 0.0
+    assert math.isclose(mid.facing, 0.0)
+    assert math.isclose(tracks.pose(0, 4000).facing, 1.0)
+    assert tracks.pose(0, 4500).x == 10.0
+    assert not tracks.present(0, 8000) and tracks.pose(0, 8000) is None
+    back = tracks.pose(0, 12000)
+    assert back is not None and (back.x, back.y) == (40.0, 8.0)
+    assert math.isclose(back.facing, 2.0)
+    later = tracks.pose(0, 14000)
+    assert later is not None and later.x == 45.0
+    assert math.isclose(later.facing, 2.0)
+
+
 def test_angle_to_follows_wow_facing():
     assert angle_to((0, 0), (1, 0)) == 0.0  # north
     assert math.isclose(angle_to((0, 0), (0, 1)), math.pi / 2)  # west
     assert math.isclose(angle_to((0, 0), (0, -1)), 3 * math.pi / 2)
+
+
+def test_npc_return_holds_its_last_position_through_activity_grace():
+    boss = Actor(0, "Creature-0-0-0-0-1-1", "首领", ActorKind.NPC, npc_id=1, hostile=True)
+    data = FightData(
+        Fight(1, 1, "x", 16, 20, 40000, False),
+        {0: boss},
+        [Event(5000, "UNIT_DIED", dst=0)],
+        {
+            0: [
+                Sample(0, 0.0, 0.0, 0.0, 100, 100),
+                Sample(4000, 0.0, 0.0, 0.0, 80, 100),
+                Sample(10000, 10.0, 0.0, 1.0, 100, 100),
+                Sample(12000, 20.0, 0.0, 1.5, 80, 100),
+                Sample(30000, 100.0, 8.0, 2.0, 100, 100),
+                Sample(32000, 120.0, 8.0, 2.5, 80, 100),
+            ]
+        },
+    )
+    tracks = Tracks(data)
+    assert tracks.position(0, 11000) == (15.0, 0.0)
+    assert tracks.present(0, 13000) and tracks.position(0, 13000) == (20.0, 0.0)
+    assert tracks.position(0, 13500) == (20.0, 0.0)
+    assert not tracks.present(0, 13501) and tracks.position(0, 13501) is None
+    assert tracks.position(0, 29999) is None
+    assert tracks.position(0, 30000) == (100.0, 8.0)
+    assert tracks.position(0, 31000) == (110.0, 8.0)
 
 
 def test_presence_and_death(fight_data):

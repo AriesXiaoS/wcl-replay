@@ -9,7 +9,8 @@ import bisect
 import html
 
 from PySide6.QtCore import QTimer, QUrl
-from PySide6.QtWidgets import QTextBrowser, QWidget
+from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor, QTextFormat, QTextTable
+from PySide6.QtWidgets import QTextBrowser, QTextEdit, QWidget
 
 from ..bosses.base import Cell, Seg, fmt_time
 from . import theme
@@ -99,8 +100,13 @@ class EventLogPanel(QTextBrowser):
         self.setOpenLinks(False)
         self.anchorClicked.connect(self._on_anchor)
         self.document().setDefaultStyleSheet("a { text-decoration: none; }")
-        self._key: tuple | None = None
+        self.document().setUndoRedoEnabled(False)
+        self._key: tuple[int, int] | None = None
         self._times: list[int] = []
+        self._visible_indices: list[int] = []
+        self._table: QTextTable | None = None
+        self._future_marks: list[QTextEdit.ExtraSelection] = []
+        self._inline_backgrounds: list[list[QTextEdit.ExtraSelection]] = []
         ctl.sessionChanged.connect(self._on_session)
         ctl.analysisChanged.connect(self._on_session)
         ctl.timeChanged.connect(lambda _t: self._render())
@@ -119,7 +125,14 @@ class EventLogPanel(QTextBrowser):
     def _render(self, force: bool = False) -> None:
         s = self.ctl.session
         if s is None:
-            self.setHtml("")
+            self._key = None
+            self._visible_indices = []
+            self._table = None
+            self._future_marks = []
+            self._inline_backgrounds = []
+            self.setExtraSelections([])
+            if force or not self.document().isEmpty():
+                self.setHtml("")
             return
         t = self.ctl.t
         cur = bisect.bisect_right(self._times, t)
@@ -127,27 +140,89 @@ class EventLogPanel(QTextBrowser):
         key = (lo, cur)
         if key == self._key and not force:
             return
+        if force or self._key is None:
+            self._build_log()
+        self._update_marks(lo, cur)
         self._key = key
+        if self._visible_indices:
+            visible_cur = bisect.bisect_left(self._visible_indices, cur)
+            anchor_at = max(0, visible_cur - 3)
+            self.scrollToAnchor(f"event-{self._visible_indices[anchor_at]}")
+
+    def _build_log(self) -> None:
+        """Build rich text only when its content or lane filtering changes."""
+        s = self.ctl.session
         parts = [
             f'<p style="color:{theme.TEXT_DIM}; font-weight:bold;">WHAT HAPPENED · 点击跳转</p>',
             '<table width="100%" cellspacing="0" cellpadding="3">',
         ]
         visible = [(i, e) for i, e in enumerate(s.analysis.log) if not e.lane or self.ctl.layer_on(e.lane)]
-        visible_cur = bisect.bisect_left([i for i, _e in visible], cur)
-        anchor_at = max(0, visible_cur - 3)
-        for row, (i, e) in enumerate(visible):
-            bg = f' bgcolor="{theme.PANEL_2}"' if lo <= i < cur else ""
-            name = '<a name="cur"></a>' if row == anchor_at else ""
+        self._visible_indices = [i for i, _e in visible]
+        for i, e in visible:
+            name = f'<a name="event-{i}"></a>'
             body = "".join(seg_html(sg) for sg in e.segments)
             if e.sub:
                 body += "<br>" + "".join(seg_html(sg) for sg in e.sub)
-            future = i >= cur
-            tcol = theme.TEXT_DIM if not future else _mix(theme.TEXT_DIM, theme.PANEL, 0.4)
             parts.append(
-                f'<tr{bg}><td width="38" valign="top">{name}<a href="t:{e.t}" style="color:{tcol};">'
+                f'<tr><td width="38" valign="top">{name}<a href="t:{e.t}" style="color:{theme.TEXT_DIM};">'
                 f'{fmt_time(e.t)}</a></td><td><a href="t:{e.t}">{body}</a></td></tr>'
             )
         parts.append("</table>")
         self.setHtml("".join(parts))
-        if visible:
-            self.scrollToAnchor("cur")
+        self._table = next(
+            (frame for frame in self.document().rootFrame().childFrames() if isinstance(frame, QTextTable)),
+            None,
+        )
+        future = QTextCharFormat()
+        future.setForeground(QColor(_mix(theme.TEXT_DIM, theme.PANEL, 0.4)))
+        self._future_marks = [self._cell_mark(row, 0, future) for row in range(len(visible))]
+        self._inline_backgrounds = [self._background_marks(row) for row in range(len(visible))]
+
+    def _update_marks(self, lo: int, cur: int) -> None:
+        """Paint time-dependent styles without changing or laying out the rich-text table."""
+        if self._table is None:
+            return
+        indices = self._visible_indices
+        start, stop = bisect.bisect_left(indices, lo), bisect.bisect_left(indices, cur)
+        highlighted = QTextCharFormat()
+        highlighted.setBackground(QColor(theme.PANEL_2))
+        highlighted.setProperty(QTextFormat.Property.FullWidthSelection, True)
+        marks = self._future_marks[stop:]
+        marks.extend(
+            self._cell_mark(row, column, highlighted) for row in range(start, stop) for column in range(2)
+        )
+        # The row tint must stay behind badge backgrounds already present in the rich text.
+        marks.extend(mark for row in range(start, stop) for mark in self._inline_backgrounds[row])
+        self.setExtraSelections(marks)
+
+    def _cell_mark(self, row: int, column: int, fmt: QTextCharFormat) -> QTextEdit.ExtraSelection:
+        cell = self._table.cellAt(row, column)
+        mark = QTextEdit.ExtraSelection()
+        mark.cursor = cell.firstCursorPosition()
+        mark.cursor.setPosition(cell.lastCursorPosition().position(), QTextCursor.MoveMode.KeepAnchor)
+        mark.format = fmt
+        return mark
+
+    def _background_marks(self, row: int) -> list[QTextEdit.ExtraSelection]:
+        cell = self._table.cellAt(row, 1)
+        start, end = cell.firstCursorPosition().position(), cell.lastCursorPosition().position()
+        block = self.document().findBlock(start)
+        marks = []
+        while block.isValid() and block.position() < end:
+            fragments = block.begin()
+            while not fragments.atEnd():
+                fragment = fragments.fragment()
+                fmt = fragment.charFormat()
+                if fmt.hasProperty(QTextFormat.Property.BackgroundBrush):
+                    mark = QTextEdit.ExtraSelection()
+                    mark.cursor = QTextCursor(self.document())
+                    mark.cursor.setPosition(max(start, fragment.position()))
+                    mark.cursor.setPosition(
+                        min(end, fragment.position() + fragment.length()), QTextCursor.MoveMode.KeepAnchor
+                    )
+                    mark.format = QTextCharFormat()
+                    mark.format.setBackground(fmt.background())
+                    marks.append(mark)
+                fragments += 1
+            block = block.next()
+        return marks

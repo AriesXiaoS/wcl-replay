@@ -23,16 +23,26 @@ from .. import __version__
 from .theme import ACCENT
 
 MAX_CACHED_FIGHTS = "max_cached_fights"
+MAX_CACHED_WCL_FIGHTS = "max_cached_wcl_fights"
 PROJECT_URL = "https://github.com/AriesXiaoS/wcl-replay"
 
 
 def cached_limit(settings: QSettings) -> int:
-    """How many finished local-log pulls stay in memory. WCL queries are not capped."""
+    """How many finished local-log pulls stay in memory."""
     try:
         value = int(settings.value(MAX_CACHED_FIGHTS, 3))
     except (TypeError, ValueError):
         return 3
     return max(1, min(50, value))
+
+
+def cached_wcl_limit(settings: QSettings) -> int:
+    """Optional WCL result limit. Zero keeps the existing unlimited behavior."""
+    try:
+        value = int(settings.value(MAX_CACHED_WCL_FIGHTS, 0))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(50, value))
 
 
 class SettingsDialog(QDialog):
@@ -69,7 +79,8 @@ class SettingsDialog(QDialog):
         hint = QLabel(
             "只统计本地日志里已经算完的轮次。达到上限后再计算新的一场，会释放最早计算、且没有收藏的那场已算完的内存。"
             "收藏的轮次会留下。每行的 × 同样只释放这一场的内存，列表项还在。"
-            "WCL 列表不自动清理。收藏的场次在清除缓存时会留下，× 会删掉整条记录。"
+            "WCL 可单独设置上限，默认不限制。自动释放时列表记录会留下，点击可重新加载；"
+            "收藏和正在回放的场次会保留。收藏的场次在清除缓存时也会留下，× 会删掉整条记录。"
         )
         hint.setWordWrap(True)
         self.keep = QSpinBox()
@@ -80,9 +91,19 @@ class SettingsDialog(QDialog):
         row.addWidget(QLabel("本地日志最多保留"))
         row.addWidget(self.keep)
         row.addStretch(1)
+        self.wcl_keep = QSpinBox()
+        self.wcl_keep.setRange(0, 50)
+        self.wcl_keep.setSpecialValueText("不限制")
+        self.wcl_keep.setValue(cached_wcl_limit(self.settings))
+        self.wcl_keep.setSuffix(" 场")
+        wcl_row = QHBoxLayout()
+        wcl_row.addWidget(QLabel("WCL 战斗最多保留"))
+        wcl_row.addWidget(self.wcl_keep)
+        wcl_row.addStretch(1)
         page = QVBoxLayout()
         page.addWidget(hint)
         page.addLayout(row)
+        page.addLayout(wcl_row)
         page.addStretch(1)
         body = QWidget()
         body.setLayout(page)
@@ -103,7 +124,7 @@ class SettingsDialog(QDialog):
                 "禁止出售、嵌入收费产品，或用于收费服务。",
             )
         )
-        page.addWidget(_about_block("更新", "新版本发布在下面的地址。"))
+        page.addWidget(_about_block("源码与更新", "软件源码以及最新的更新可以在这个 GitHub 界面找到。"))
         page.addWidget(_project_link())
         page.addStretch(1)
         body = QWidget()
@@ -112,6 +133,7 @@ class SettingsDialog(QDialog):
 
     def _save(self) -> None:
         self.settings.setValue(MAX_CACHED_FIGHTS, self.keep.value())
+        self.settings.setValue(MAX_CACHED_WCL_FIGHTS, self.wcl_keep.value())
         self.accept()
 
 

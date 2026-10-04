@@ -386,6 +386,18 @@ class P1Model:
     def next_sever(self, t: float) -> SeverRec | None:
         return next((s for s in self.severs if s.t > t), None)
 
+    def cleave_target_at(self, t: float) -> int | None:
+        """Who the visible frontal is aimed at, while that cone is on screen."""
+        active = [
+            rec
+            for rec in (*self.severs, *self.blighted)
+            if rec.target >= 0 and rec.t - C.SEVER_PREVIEW_MS <= t <= rec.t + 600
+        ]
+        if not active:
+            return None
+        active.sort(key=lambda rec: (t < rec.cast_start, abs(rec.t - t)))
+        return active[0].target
+
     # -- outputs ------------------------------------------------------------------------------
 
     def lanes(self) -> list[Lane]:
@@ -620,9 +632,15 @@ class P1Model:
     def _frontal(self, rec: SeverRec, t: float, radius: float, name: str) -> Cone | None:
         if not (rec.t - C.SEVER_PREVIEW_MS <= t <= rec.t + 600):
             return None
-        bpos = self.tracks.position(self.boss, t) or (rec.bx, rec.by)
-        tpos = self.tracks.position(rec.target, t) if rec.target >= 0 else None
-        direction = angle_to(bpos, tpos) if (tpos and t < rec.t) else rec.direction
+        bpos = (rec.bx, rec.by)
+        direction = rec.direction
+        if t < rec.t:
+            bpos = self.tracks.position(self.boss, t) or bpos
+            tpos = self.tracks.position(rec.target, t) if rec.target >= 0 else None
+            # Aim at the tank until impact, then retain the geometry used to resolve popped orbs.
+            # Logged facing on incoming hits must not steer the preview.
+            if tpos is not None:
+                direction = angle_to(bpos, tpos)
         casting = t >= rec.cast_start
         return Cone(
             bpos[0],

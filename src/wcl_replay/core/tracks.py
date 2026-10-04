@@ -56,10 +56,11 @@ class Track:
     def pose(self, t: float) -> Pose:
         return self.pose_span(t, 0, len(self.t))
 
-    def pose_span(self, t: float, lo: int, hi: int) -> Pose:
+    def pose_span(self, t: float, lo: int, hi: int, *, hold_facing: bool = False) -> Pose:
         """Interpolate using samples ``[lo, hi)`` only. Outside that span the pose holds.
 
-        Position and facing blend. Facing takes the short arc. Health stays on the earlier sample.
+        Position blends. Facing blends along the short arc, unless ``hold_facing`` keeps the
+        earlier sample until the next one arrives. Health stays on the earlier sample.
         """
         ts = self.t
         i = int(np.searchsorted(ts, t, side="right"))
@@ -77,7 +78,11 @@ class Track:
             f = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
             x = self.x[j] * (1 - f) + self.x[i] * f
             y = self.y[j] * (1 - f) + self.y[i] * f
-            facing = _lerp_angle(float(self.facing[j]), float(self.facing[i]), f)
+            facing = (
+                float(self.facing[j])
+                if hold_facing
+                else _lerp_angle(float(self.facing[j]), float(self.facing[i]), f)
+            )
         return Pose(float(x), float(y), facing, int(self.hp[j]), int(self.max_hp[j]))
 
     def position(self, t: float) -> tuple[float, float]:
@@ -176,13 +181,22 @@ class Tracks:
             return None
         lives = self._player_lives.get(actor_id)
         if not lives:
-            position = tr.pose(t)
             actor = self.data.actors.get(actor_id)
-            observed = self.observed_track(actor_id)
-            if actor is not None and actor.is_player and actor_id in self.derived and observed is not None:
-                health = observed.pose(t)
-                position.hp, position.max_hp = health.hp, health.max_hp
-            return position
+            if actor is not None and actor.is_player:
+                position = tr.pose(t)
+                observed = self.observed_track(actor_id)
+                if actor_id in self.derived and observed is not None:
+                    health = observed.pose(t)
+                    position.hp, position.max_hp = health.hp, health.max_hp
+                return position
+            # NPCs keep the last logged facing until the next sample. A death closes the life:
+            # nothing is drawn across the gap, and the next life does not slide out of the old spot.
+            if not self.present(actor_id, t):
+                return None
+            lo, hi = self._npc_life_slice(tr, actor_id, t)
+            if hi <= lo:
+                return None
+            return tr.pose_span(t, lo, hi, hold_facing=True)
         if actor_id in self.derived:
             # Life boundaries and health come from observations; indices belong to the prediction.
             observed = self.tracks[actor_id]
@@ -207,6 +221,36 @@ class Tracks:
     def position(self, actor_id: int, t: float) -> tuple[float, float] | None:
         pose = self.pose(actor_id, t)
         return (pose.x, pose.y) if pose is not None else None
+
+    def _npc_life_slice(self, tr: Track, actor_id: int, t: float) -> tuple[int, int]:
+        """Sample range of the life that contains ``t``.
+
+        Samples after ``UNIT_DIED`` belong to a later return. Each return's last sample
+        also closes interpolation, so its activity grace holds instead of sliding to the next return.
+        """
+        n = len(tr)
+        deaths = self.deaths.get(actor_id) or []
+        if not deaths or n == 0:
+            return 0, n
+        lo = 0
+        hi = n
+        for start, last in self._returns.get(actor_id, ()):
+            if start <= t:
+                lo = int(np.searchsorted(tr.t, start, side="left"))
+                hi = int(np.searchsorted(tr.t, last, side="right"))
+            else:
+                break
+        if lo >= n:
+            return n, n
+        life_start = int(tr.t[lo])
+        for death in deaths:
+            if death < life_start:
+                continue
+            cut = int(np.searchsorted(tr.t, death, side="right"))
+            hi = min(hi, cut)
+            if t <= death:
+                break
+        return lo, hi
 
     def appear_time(self, actor_id: int) -> int:
         return self.spawn.get(actor_id, self.first_seen.get(actor_id, 0))

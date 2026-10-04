@@ -536,7 +536,10 @@ class MapView(QWidget):
         r = self._unit_radius(style.radius_px)
         out[aid] = (c, r)
         if style.show_facing:
-            dx, dy = -math.sin(pose.facing), -math.cos(pose.facing)
+            facing = s.analysis.facing_at(aid, t)
+            if facing is None:
+                facing = pose.facing
+            dx, dy = -math.sin(facing), -math.cos(facing)
             p.setPen(QPen(qcolor(style.border, 0.9), 3))
             p.drawLine(c, QPointF(c.x() + dx * (r + 7), c.y() + dy * (r + 7)))
         p.setPen(QPen(QColor(style.border), 2.5 if style.show_facing else 1.5))
