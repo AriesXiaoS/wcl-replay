@@ -7,7 +7,7 @@ Globule model, as observed in the log:
 - a floor orb is one place-cast (``GREEN_PLACE`` / ``PURPLE_PLACE``), not one actor id. The cast
   carries the coordinates. A wave orb also has a summon a few dozen milliseconds earlier; a drop
   (the new unit that appears when a carry ends) is the same cast with no summon. WCL reuses
-  ``sourceInstance`` for that drop, so both sources go through ``globules_of`` and ignore actor id,
+  ``sourceInstance`` for that drop, so both sources identify each orb by its place-cast,
 - a pickup is a carry debuff on a player (the floor unit gets no event, so the nearest one of that
   color is taken), and when the 5 s debuff ends a *new* unit appears under the player (the drop),
 - Sever gives the whole raid one Rupture stack per popped globule, so the popped count is exact;
@@ -66,6 +66,7 @@ class _Place:
 def globules_of(data: FightData, tracks: Tracks) -> list[Globule]:
     """Floor orbs from place-casts. A summon within ``_SPAWN_WINDOW_MS`` marks a wave orb.
 
+    Known summon targets match their own place-cast before target-less summons use timing alone.
     Drops have no summon. WCL stamps the drop with an instance id that already belongs to an
     earlier orb, so the same actor can own several of these casts; each cast is still its own orb.
     """
@@ -79,17 +80,21 @@ def globules_of(data: FightData, tracks: Tracks) -> list[Globule]:
             continue
         casts.append(_Place(e.t, e.src, color, pos[0], pos[1]))
     summons = [e for e in data.events if e.type == "SPELL_SUMMON" and e.spell_id in _SUMMON]
-    pairs: list[tuple[int, int, int]] = []
+    pairs: list[tuple[bool, int, int, int]] = []
     for si, summon in enumerate(summons):
         color = _SUMMON[summon.spell_id]
+        target_less = summon.dst < 0
         for i, cast in enumerate(casts):
+            if not target_less and summon.dst != cast.src:
+                continue
             dt = cast.t - summon.t
             if cast.color == color and 0 <= dt <= _SPAWN_WINDOW_MS:
-                pairs.append((dt, si, i))
+                # Resolve known identities first; a closer target-less summon must not steal them.
+                pairs.append((target_less, dt, si, i))
     pairs.sort()
     spawn_at: dict[int, int] = {}
     used: set[int] = set()
-    for _dt, si, i in pairs:
+    for _target_less, _dt, si, i in pairs:
         if si in used or i in spawn_at:
             continue
         used.add(si)

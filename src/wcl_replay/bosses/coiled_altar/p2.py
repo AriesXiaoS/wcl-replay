@@ -138,7 +138,15 @@ class Bomb:
 
 
 class P2Model:
-    def __init__(self, data: FightData, tracks: Tracks, times: list[int], p2_start: int):
+    def __init__(
+        self,
+        data: FightData,
+        tracks: Tracks,
+        times: list[int],
+        p2_start: int,
+        *,
+        defer_motion: bool = False,
+    ):
         self.data = data
         self.tracks = tracks
         self.times = times
@@ -168,7 +176,9 @@ class P2Model:
         self.accel_s = C.GHOST_ACCEL_S
         self._log_pos = self._logged_positions()
         self._routes: dict[int, tuple[tuple[int, float, float], ...]] = {}
-        self._simulate_ghosts()
+        self._simulated_motion: tuple | None = None
+        if not defer_motion:
+            self.set_motion()
         self.bomb_iv = aura_intervals(data, C.GLOOMBOMB)
         self.resonance_iv = aura_intervals(data, {C.RESONANCE, C.RESONANCE_MARK})
         self.bombs = self._bombs()
@@ -306,7 +316,6 @@ class P2Model:
         pause_s: float | None = None,
     ) -> None:
         """Rebuild every ghost path from spawn to despawn. The log has neither speed nor a facing cone."""
-        before = self._motion_key()
         if speed is not None:
             self.speed = max(0.0, float(speed))
         if face_deg is not None:
@@ -321,9 +330,10 @@ class P2Model:
             self.accel_s = max(0.0, float(accel_s))
         if pause_s is not None:
             self.pause_s = max(0.0, float(pause_s))
-        if self._motion_key() == before and any(self.tracks.has(g.aid) for g in self.ghosts):
+        if self._motion_key() == self._simulated_motion:
             return
         self._simulate_ghosts()
+        self._simulated_motion = self._motion_key()
 
     def _motion_key(self) -> tuple:
         face = round(self.face_deg, 4)

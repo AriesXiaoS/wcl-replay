@@ -69,7 +69,9 @@ def clip_world_markers(
     unload = _zone_unload_removes(events)
     ordered = sorted(
         (e for e in events if e.instance_id in (0, instance_id)),
-        key=lambda e: (e.abs_ms, e.placed),
+        # Millisecond timestamps can tie after truncating the log's finer precision.
+        # The byte offset preserves whether the beam was placed or removed last.
+        key=lambda e: (e.abs_ms, e.offset),
     )
     open_: dict[int, tuple[float, float, int]] = {}
     out: list[WorldMarker] = []

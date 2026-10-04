@@ -132,12 +132,12 @@ class EventLogPanel(QTextBrowser):
             f'<p style="color:{theme.TEXT_DIM}; font-weight:bold;">WHAT HAPPENED · 点击跳转</p>',
             '<table width="100%" cellspacing="0" cellpadding="3">',
         ]
-        anchor_at = max(0, cur - 3)
-        for i, e in enumerate(s.analysis.log):
-            if e.lane and not self.ctl.layer_on(e.lane):
-                continue
+        visible = [(i, e) for i, e in enumerate(s.analysis.log) if not e.lane or self.ctl.layer_on(e.lane)]
+        visible_cur = bisect.bisect_left([i for i, _e in visible], cur)
+        anchor_at = max(0, visible_cur - 3)
+        for row, (i, e) in enumerate(visible):
             bg = f' bgcolor="{theme.PANEL_2}"' if lo <= i < cur else ""
-            name = '<a name="cur"></a>' if i == anchor_at else ""
+            name = '<a name="cur"></a>' if row == anchor_at else ""
             body = "".join(seg_html(sg) for sg in e.segments)
             if e.sub:
                 body += "<br>" + "".join(seg_html(sg) for sg in e.sub)
@@ -149,4 +149,5 @@ class EventLogPanel(QTextBrowser):
             )
         parts.append("</table>")
         self.setHtml("".join(parts))
-        self.scrollToAnchor("cur")
+        if visible:
+            self.scrollToAnchor("cur")

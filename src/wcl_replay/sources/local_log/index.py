@@ -16,9 +16,11 @@ import json
 import logging
 import math
 import mmap
+import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 from ...core.cancellation import check_cancelled
 from ...core.difficulty import DIFFICULTY_LABELS
@@ -28,11 +30,13 @@ from ...storage import cache_warning, write_json
 from .fields import split_fields
 from .timestamps import parse_ts_ms
 
-INDEX_VERSION = 6
+INDEX_VERSION = 8
 
 # Report progress through a long scan. One mmap.find over a multi-gigabyte log would not
 # publish a fraction until it returned.
 _SCAN_CHUNK = 8 * 1024 * 1024
+_CANCEL_LINES = 1024
+_CANCEL_BYTES = 256 * 1024
 
 
 @dataclass(slots=True)
@@ -75,6 +79,56 @@ def _prefix_digest(path: Path, size: int, progress: Callable[[float], None] | No
     return digest.hexdigest()
 
 
+def _windows_change_time_ns(file: BinaryIO) -> int | None:
+    """Read Windows metadata change time; ``st_ctime`` is creation time there."""
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        class FileBasicInfo(ctypes.Structure):
+            _fields_ = [
+                ("creation_time", ctypes.c_longlong),
+                ("last_access_time", ctypes.c_longlong),
+                ("last_write_time", ctypes.c_longlong),
+                ("change_time", ctypes.c_longlong),
+                ("attributes", wintypes.DWORD),
+            ]
+
+        query = ctypes.WinDLL("kernel32", use_last_error=True).GetFileInformationByHandleEx
+        query.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        query.restype = wintypes.BOOL
+        info = FileBasicInfo()
+        # Borrow the existing handle. The Python file owns and closes it.
+        handle = msvcrt.get_osfhandle(file.fileno())
+        if query(handle, 0, ctypes.byref(info), ctypes.sizeof(info)) and info.change_time > 0:
+            return info.change_time * 100
+    except (AttributeError, ImportError, OSError, ValueError):
+        pass
+    return None
+
+
+def _file_metadata(path: Path) -> tuple[os.stat_result, int | None]:
+    """Read identity and change time from the same file, without reading its contents."""
+    with path.open("rb") as file:
+        stat = os.fstat(file.fileno())
+        if os.name == "nt":
+            change_time = _windows_change_time_ns(file)
+        else:
+            change_time = getattr(stat, "st_ctime_ns", None)
+        return stat, change_time if isinstance(change_time, int) and change_time > 0 else None
+
+
+def _metadata_matches(cached: dict, stat: os.stat_result, change_time: int | None) -> bool:
+    return (
+        change_time is not None
+        and cached.get("change_time_ns") == change_time
+        and cached.get("identity") == [stat.st_dev, stat.st_ino]
+        and cached.get("size") == stat.st_size
+        and cached.get("mtime_ns") == stat.st_mtime_ns
+    )
+
+
 def _cache_file(path: Path) -> Path:
     key = hashlib.sha1(str(path.resolve()).lower().encode("utf-8")).hexdigest()[:16]
     d = cache_dir() / "index"
@@ -89,6 +143,10 @@ def _read_cache(path: Path) -> dict:
         return {}
     if not isinstance(cached.get("size"), int) or cached["size"] < 0:
         raise ValueError("索引缓存大小错误")
+    if cached.get("change_time_ns") is not None and (
+        type(cached["change_time_ns"]) is not int or cached["change_time_ns"] <= 0
+    ):
+        raise ValueError("索引缓存变更时间错误")
     if not isinstance(cached.get("entries"), list) or not isinstance(cached.get("markers"), list):
         raise ValueError("索引缓存列表错误")
     for raw in cached["entries"]:
@@ -147,20 +205,22 @@ def _find_yielding(
     progress: Callable[[float], None] | None,
     *,
     chunk: int = _SCAN_CHUNK,
+    end: int | None = None,
 ) -> int:
-    """Find ``needle`` at or after ``start``. ``progress`` receives absolute ``pos / len``."""
+    """Find ``needle`` in ``[start, end)``. Progress receives absolute ``pos / len``."""
     size = len(mm)
-    if start >= size:
+    stop = size if end is None else min(size, end)
+    if start >= stop:
         return -1
     overlap = max(0, len(needle) - 1)
     pos = start
-    while pos < size:
+    while pos < stop:
         check_cancelled()
-        end = min(size, pos + chunk)
-        found = mm.find(needle, pos, min(size, end + overlap))
+        chunk_end = min(stop, pos + chunk)
+        found = mm.find(needle, pos, min(stop, chunk_end + overlap))
         if found >= 0:
             return found
-        pos = end
+        pos = chunk_end
         if progress is not None and size:
             progress(pos / size)
     return -1
@@ -214,6 +274,10 @@ def _scan(
 ) -> None:
     size = len(mm)
     pos = start_pos
+    # Recover the map before an incremental scan once. Later starts only inspect new bytes.
+    map_index = _rfind_yielding(mm, b"  MAP_CHANGE,", 0, start_pos) if start_pos else -1
+    map_line = _line_at(mm, map_index)[2] if map_index >= 0 else None
+    map_pos = start_pos
     open_entry: EncounterEntry | None = None
     while True:
         i = _find_yielding(mm, b"  ENCOUNTER_", pos, progress)
@@ -247,8 +311,9 @@ def _scan(
         if f[0] == "ENCOUNTER_START" and len(f) >= 6:
             if open_entry is not None:
                 open_entry.end_offset = ls
-            mi = _rfind_yielding(mm, b"  MAP_CHANGE,", 0, ls)
-            map_line = _line_at(mm, mi)[2] if mi >= 0 else None
+            while (mi := _find_yielding(mm, b"  MAP_CHANGE,", map_pos, None, end=ls)) >= 0:
+                _map_start, map_pos, map_line = _line_at(mm, mi)
+            map_pos = ls
             open_entry = EncounterEntry(
                 seq=len(entries) + 1,
                 encounter_id=int(f[1]),
@@ -319,6 +384,8 @@ def _scan_markers(
 
 def _mark_zone_unloads(mm: mmap.mmap, markers: list[MarkerEvent]) -> None:
     """Reclassify old removals too: an appended zone change can complete their context."""
+    if not any(not event.placed for event in markers):
+        return
     zones: list[int] = []
     pos = 0
     while True:
@@ -346,12 +413,10 @@ def marker_events(path: str | Path) -> list[MarkerEvent]:
     try:
         if cf.exists():
             cached = _read_cache(cf)
-            st = path.stat()
+            st, change_time = _file_metadata(path)
             if (
                 cached.get("version") == INDEX_VERSION
-                and cached.get("size") == st.st_size
-                and cached.get("mtime_ns") == st.st_mtime_ns
-                and cached.get("identity") == [st.st_dev, st.st_ino]
+                and _metadata_matches(cached, st, change_time)
                 and "markers" in cached
             ):
                 return [MarkerEvent(**m) for m in cached["markers"]]
@@ -372,8 +437,14 @@ def _fight_duration(mm: mmap.mmap, entry: EncounterEntry) -> int:
     start_ms = parse_ts_ms(entry.start_ts)
     duration = 0
     pos = entry.start_offset
+    checked_pos = pos
+    lines_since_check = 0
+    check_cancelled()
     while pos < entry.end_offset:
-        check_cancelled()
+        if lines_since_check >= _CANCEL_LINES or pos - checked_pos >= _CANCEL_BYTES:
+            check_cancelled()
+            checked_pos = pos
+            lines_since_check = 0
         end = mm.find(b"\n", pos, entry.end_offset)
         if end < 0:
             end = entry.end_offset
@@ -384,14 +455,14 @@ def _fight_duration(mm: mmap.mmap, entry: EncounterEntry) -> int:
             except (UnicodeDecodeError, ValueError):
                 pass
         pos = end + 1
+        lines_since_check += 1
+    check_cancelled()
     return duration
 
 
-def _analysis_digest(mm: mmap.mmap, entry: EncounterEntry, markers: list[MarkerEvent]) -> str:
+def _analysis_digest(entry: EncounterEntry, markers: list[MarkerEvent]) -> str:
     """Identity of the pull bytes and the external map/marker context actually used by analysis."""
-    clipped = clip_world_markers(
-        markers, parse_ts_ms(entry.start_ts), _fight_duration(mm, entry), entry.instance_id
-    )
+    clipped = clip_world_markers(markers, parse_ts_ms(entry.start_ts), entry.duration_ms, entry.instance_id)
     payload = [entry.content_digest, entry.map_line, [asdict(marker) for marker in clipped]]
     return hashlib.blake2b(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"), digest_size=16
@@ -407,8 +478,9 @@ def _number_pulls(entries: list[EncounterEntry]) -> None:
 
 
 def index_log(path: str | Path, progress: Callable[[float], None] | None = None) -> list[EncounterEntry]:
+    check_cancelled()
     path = Path(path)
-    st = path.stat()
+    st, change_time = _file_metadata(path)
     cf = _cache_file(path)
     entries: list[EncounterEntry] = []
     markers: list[MarkerEvent] = []
@@ -418,6 +490,11 @@ def index_log(path: str | Path, progress: Callable[[float], None] | None = None)
             cached = _read_cache(cf)
             if cached.get("version") == INDEX_VERSION and "markers" in cached:
                 old = [EncounterEntry(**e) for e in cached["entries"]]
+                if _metadata_matches(cached, st, change_time):
+                    check_cancelled()
+                    if progress:
+                        progress(1.0)
+                    return old
                 unchanged = (
                     cached.get("identity") == [st.st_dev, st.st_ino]
                     and 0 <= cached["size"] <= st.st_size
@@ -427,6 +504,18 @@ def index_log(path: str | Path, progress: Callable[[float], None] | None = None)
                     )
                 )
                 if unchanged and cached["size"] == st.st_size:
+                    check_cancelled()
+                    if (
+                        cached.get("mtime_ns") != st.st_mtime_ns
+                        or cached.get("change_time_ns") != change_time
+                    ):
+                        # A touch or attribute change needs only one content verification.
+                        cached["mtime_ns"] = st.st_mtime_ns
+                        cached["change_time_ns"] = change_time
+                        try:
+                            write_json(cf, cached)
+                        except OSError as exc:
+                            cache_warning(exc)
                     if progress:
                         progress(1.0)
                     return old
@@ -461,7 +550,7 @@ def index_log(path: str | Path, progress: Callable[[float], None] | None = None)
                         entry.content_digest = hashlib.blake2b(
                             view[entry.start_offset : entry.end_offset], digest_size=16
                         ).hexdigest()
-                    entry.analysis_digest = _analysis_digest(mm, entry, markers)
+                    entry.analysis_digest = _analysis_digest(entry, markers)
             finally:
                 view.release()
     for i, e in enumerate(entries, 1):
@@ -471,6 +560,7 @@ def index_log(path: str | Path, progress: Callable[[float], None] | None = None)
         "version": INDEX_VERSION,
         "size": st.st_size,
         "mtime_ns": st.st_mtime_ns,
+        "change_time_ns": change_time,
         "identity": [st.st_dev, st.st_ino],
         "digest": _prefix_digest(
             path, st.st_size, (lambda frac: progress(0.8 + frac * 0.2)) if progress else None

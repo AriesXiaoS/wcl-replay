@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -24,6 +25,113 @@ from ..bosses.base import fmt_time
 from ..core.difficulty import DIFFICULTY_LABELS
 from .controller import ReplayController
 from .log_panel import PullLoads, _PullRow
+
+
+def split_phase(message: str) -> tuple[str, str]:
+    """``phase:download`` or ``phase:compute``, with an optional ``:detail`` tail."""
+    for phase in ("download", "compute"):
+        prefix = f"phase:{phase}"
+        if message == prefix:
+            return phase, ""
+        if message.startswith(prefix + ":"):
+            return phase, message[len(prefix) + 1 :]
+    return "download", message
+
+
+class _Meter:
+    """One labeled bar. ``value`` is 0–1000, matching the local-log rows."""
+
+    def __init__(self, caption: str, tip: str):
+        self.tip = tip
+        self.host = QWidget()
+        self.host.setObjectName("wclMeter")
+        self.host.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        row = QHBoxLayout(self.host)
+        row.setContentsMargins(24, 0, 0, 0)
+        row.setSpacing(6)
+        self.caption = QLabel(caption)
+        self.caption.setObjectName("meterCaption")
+        self.caption.setFixedWidth(36)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(8)
+        self.bar.setToolTip(tip)
+        self.percent = QLabel("0%")
+        self.percent.setObjectName("meterCaption")
+        self.percent.setFixedWidth(40)
+        self.percent.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(self.caption)
+        row.addWidget(self.bar, 1)
+        row.addWidget(self.percent)
+        self.host.hide()
+
+    def set(self, frac: float, detail: str = "") -> None:
+        clamped = max(0.0, min(1.0, frac))
+        self.bar.setValue(int(clamped * 1000))
+        self.percent.setText(f"{int(clamped * 100)}%")
+        if detail:
+            self.bar.setToolTip(detail)
+        self.host.show()
+
+    def reset(self) -> None:
+        self.bar.setToolTip(self.tip)
+        self.set(0.0)
+
+    def hide(self) -> None:
+        self.host.hide()
+
+
+class _WclRow(_PullRow):
+    """Fight row with a download bar and a separate calculation bar."""
+
+    def __init__(
+        self,
+        label: str,
+        parent: QWidget | None = None,
+        *,
+        action_tip: str = "删除这条记录并释放内存",
+        star_tip: str = "收藏。清除缓存时会留下这场。",
+    ):
+        super().__init__(label, parent, action_tip=action_tip, star_tip=star_tip)
+        lay = self.layout()
+        lay.removeWidget(self.bar)
+        self.bar.setParent(None)
+        self.download = _Meter("下载", "下载这场战斗的日志")
+        self.compute = _Meter("计算", "计算轨迹和机制")
+        lay.insertWidget(1, self.download.host)
+        lay.insertWidget(2, self.compute.host)
+
+    def reset_progress(self) -> None:
+        self.err.hide()
+        self.mark.setText("")
+        self.mark.setToolTip("")
+        self.download.reset()
+        self.compute.reset()
+
+    def show_phase(self, phase: str, frac: float, detail: str = "") -> None:
+        self.err.hide()
+        self.mark.setText("")
+        self.mark.setToolTip("")
+        self.download.host.show()
+        self.compute.host.show()
+        meter = self.compute if phase == "compute" else self.download
+        meter.set(frac, detail)
+
+    def mark_done(self) -> None:
+        self.download.hide()
+        self.compute.hide()
+        super().mark_done()
+
+    def release_result(self) -> None:
+        self.download.hide()
+        self.compute.hide()
+        super().release_result()
+
+    def mark_error(self, message: str) -> None:
+        self.download.hide()
+        self.compute.hide()
+        super().mark_error(message)
 
 
 def quota_text(spent: float, limit: int, reset_in: int) -> tuple[str, str]:
@@ -59,7 +167,7 @@ class WclPanel(QFrame):
         super().__init__(parent)
         self.setObjectName("logCard")
         self.setMinimumWidth(340)
-        self._rows: list[_PullRow] = []
+        self._rows: list[_WclRow] = []
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
@@ -121,6 +229,9 @@ class WclPanel(QFrame):
     def set_url(self, url: str) -> None:
         self.url_edit.setText(url)
 
+    def clear_url(self) -> None:
+        self.url_edit.clear()
+
     def set_status(self, text: str) -> None:
         self.status_lbl.setText(text)
 
@@ -131,12 +242,7 @@ class WclPanel(QFrame):
     def add_row(self, label: str) -> int:
         """Insert a row at the top. The click reports wherever that row sits when it is clicked."""
         stretch = self._list.takeAt(self._list.count() - 1)
-        row = _PullRow(
-            label,
-            self._body,
-            action_tip="删除这条记录并释放内存",
-            star_tip="收藏。清除缓存时会留下这场。",
-        )
+        row = _WclRow(label, self._body)
         row.clicked.connect(lambda r=row: self.activated.emit(self._rows.index(r)))
         row.deleteClicked.connect(lambda r=row: self.removeRequested.emit(self._rows.index(r)))
         row.starClicked.connect(lambda r=row: self.starToggled.emit(self._rows.index(r)))
@@ -147,7 +253,7 @@ class WclPanel(QFrame):
         return 0
 
     @property
-    def rows(self) -> list[_PullRow]:
+    def rows(self) -> list[_WclRow]:
         return self._rows
 
     def set_label(self, index: int, label: str) -> None:
@@ -158,8 +264,11 @@ class WclPanel(QFrame):
         for i, row in enumerate(self._rows):
             row.set_selected(i == index)
 
-    def show_progress(self, index: int, frac: float) -> None:
-        self._rows[index].show_progress(frac)
+    def reset_progress(self, index: int) -> None:
+        self._rows[index].reset_progress()
+
+    def show_progress(self, index: int, frac: float, *, phase: str = "download", detail: str = "") -> None:
+        self._rows[index].show_phase(phase, frac, detail)
 
     def mark_done(self, index: int) -> None:
         self._rows[index].mark_done()
@@ -202,7 +311,7 @@ class WclBoard:
         self.keys.insert(0, key)
         self.loads.click(key)
         self.panel.set_selected(index)
-        self.panel.show_progress(index, 0.0)
+        self.panel.reset_progress(index)
         self.panel.set_status(f"已记录 {len(self.keys)} 场")
         return index, key
 
@@ -214,13 +323,14 @@ class WclBoard:
         if action == "show" and self.active():
             self.ctl.set_session(self.loads.cache[key])
         elif action == "start":
-            self.panel.show_progress(index, 0.0)
+            self.panel.reset_progress(index)
         return action
 
-    def note_progress(self, key: tuple, frac: float, *, run_id: int | None = None) -> None:
+    def note_progress(self, key: tuple, frac: float, message: str = "", *, run_id: int | None = None) -> None:
         if key not in self.keys or not self.loads.is_current(key, run_id):
             return
-        self.panel.show_progress(self.keys.index(key), frac)
+        phase, detail = split_phase(message)
+        self.panel.show_progress(self.keys.index(key), frac, phase=phase, detail=detail)
 
     def finish(self, key: tuple, session: object, label: str, *, run_id: int | None = None) -> bool:
         if not self.loads.is_current(key, run_id):

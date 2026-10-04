@@ -155,7 +155,13 @@ class CoiledAltarAnalysis(Analysis):
     parameters = GHOST_PARAMETERS
     parameter_note = "日志不记录魂相关数据。图中的魂由上面这些参数推算而来，不一定真实，仅供参考。"
 
-    def __init__(self, data: FightData, tracks: Tracks):
+    def __init__(
+        self,
+        data: FightData,
+        tracks: Tracks,
+        *,
+        parameters: Mapping[str, ParameterValue] | None = None,
+    ):
         super().__init__(data, tracks)
         self.arena = (*C.ALTAR_X, *C.ALTAR_Y)
         orbs = (C.NPC_GREEN, C.NPC_PURPLE)
@@ -164,7 +170,11 @@ class CoiledAltarAnalysis(Analysis):
         self.p2_start = self._p2_start()
         self.p3_start = self._p3_start()
         self.p1 = P1Model(data, tracks, self.times, self.p2_start)
-        self.p2 = P2Model(data, tracks, self.times, self.p2_start) if self.p2_start is not None else None
+        self.p2 = (
+            P2Model(data, tracks, self.times, self.p2_start, defer_motion=True)
+            if self.p2_start is not None
+            else None
+        )
         self.phases = [Phase(0, "P1 · 祖尔加", "P1")]
         if self.p2_start is not None:
             self.phases.append(Phase(self.p2_start, "P2 · 妖术领主玛拉卡斯", "P2"))
@@ -185,7 +195,7 @@ class CoiledAltarAnalysis(Analysis):
         self.unit_styles = self._styles()
         if self.p2:
             self._npcs += [g.aid for g in self.p2.ghosts if g.aid not in self._npcs]
-        self.apply_parameters(self.parameter_values)
+        self.apply_parameters(parameters if parameters is not None else self.parameter_values)
 
     def _p2_start(self) -> int | None:
         zul = {a.id for a in self.data.actors_by_npc(C.NPC_ZULJAN)}
@@ -348,6 +358,14 @@ class CoiledAltar(BossModule):
 
     def analyze(self, data: FightData, tracks: Tracks) -> Analysis:
         return CoiledAltarAnalysis(data, tracks)
+
+    def analyze_with_parameters(
+        self,
+        data: FightData,
+        tracks: Tracks,
+        parameters: Mapping[str, ParameterValue] | None = None,
+    ) -> Analysis:
+        return CoiledAltarAnalysis(data, tracks, parameters=parameters)
 
     def wcl_slices(self, report: dict, fight: dict) -> tuple[WclSlice, ...]:
         return wcl_slices(report, fight)

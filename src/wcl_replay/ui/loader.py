@@ -238,6 +238,7 @@ class TaskRunner(QObject):
     def _boot(self) -> None:
         tasks = results = None
         listener = None
+        published: threading.Event | None = None
         procs: list[multiprocessing.Process] = []
         try:
             ctx = multiprocessing.get_context("spawn")
@@ -252,19 +253,25 @@ class TaskRunner(QObject):
                 )
                 proc.start()
                 procs.append(proc)
+            published = threading.Event()
             listener = threading.Thread(
-                target=self._listen, args=(results, tuple(procs)), name="wcl-replay-results", daemon=True
+                target=self._listen_after_publish,
+                args=(results, tuple(procs), published),
+                name="wcl-replay-results",
+                daemon=True,
             )
+            # Thread.start can be slow. Never hold the submission lock while starting
+            # it, or the GUI's first run() can block before its spinner gets painted.
+            listener.start()
             with self._lock:
                 closed = self._closed
                 if not closed:
-                    # Publish before listening; immediate worker failure must see the complete pool.
-                    # Starting under the lock also prevents shutdown from joining an unstarted listener.
+                    # The listener waits for publication, so immediate worker failure
+                    # still sees a complete pool and shutdown only sees a started thread.
                     self._tasks = tasks
                     self._results = results
                     self._procs = procs
                     self._listener = listener
-                    listener.start()
                 self._booting = False
                 pending = self._pending
                 self._pending = []
@@ -275,6 +282,10 @@ class TaskRunner(QObject):
                     self._tasks = self._results = None
                     self._procs = []
                     self._listener = None
+            if published is not None:
+                published.set()
+            if listener is not None and listener.ident is not None:
+                listener.join(timeout=1.0)
             for proc in procs:
                 try:
                     proc.terminate()
@@ -293,6 +304,7 @@ class TaskRunner(QObject):
                         pass
             self._fail_pending(tb)
             return
+        published.set()
         if closed:
             for proc in procs:
                 proc.terminate()
@@ -330,6 +342,13 @@ class TaskRunner(QObject):
         for job_id, *_rest in pending:
             self._failed.emit(job_id, tb)
 
+    def _listen_after_publish(self, results: Queue, procs: tuple, published: threading.Event) -> None:
+        published.wait()
+        with self._lock:
+            active = not self._closed and self._results is results
+        if active:
+            self._listen(results, procs)
+
     def _listen(self, results: Queue, procs: tuple = ()) -> None:
         while True:
             try:
@@ -354,6 +373,14 @@ class TaskRunner(QObject):
             elif kind == "done":
                 _kind, job_id, result = msg
                 self._done.emit(job_id, result)
+            elif kind == "done_bytes":
+                _kind, job_id, payload = msg
+                try:
+                    result = ForkingPickler.loads(payload)
+                except Exception:
+                    self._failed.emit(job_id, traceback.format_exc())
+                else:
+                    self._done.emit(job_id, result)
             elif kind == "fail":
                 _kind, job_id, tb = msg
                 self._failed.emit(job_id, tb)

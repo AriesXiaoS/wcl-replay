@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -60,6 +60,7 @@ class MainWindow(QMainWindow):
         self._quota_gen = 0
         self._index_job = None
         self._quota_job = None
+        self._log_dialog: QFileDialog | None = None
         self.ctl = ReplayController(self, settings=self.settings)
         self.tasks = TaskRunner(self)
         self.log_panel = LogPanel()
@@ -81,9 +82,6 @@ class MainWindow(QMainWindow):
         self.wcl_panel.clearClicked.connect(self.wcl_board.clear_cache)
         self.wcl_panel.quotaRefreshRequested.connect(self._refresh_wcl_quota)
         self.wcl_panel.activated.connect(self._on_wcl_activated)
-        last_url = str(self.settings.value("wcl_last_url", "") or "")
-        if last_url:
-            self.wcl_panel.set_url(last_url)
 
         self._build_body()
         self._shortcuts()
@@ -199,15 +197,51 @@ class MainWindow(QMainWindow):
     # -- local log ----------------------------------------------------------------------------
 
     def open_log_dialog(self) -> None:
+        if self._log_dialog is not None and self._log_dialog.isVisible():
+            self._log_dialog.raise_()
+            self._log_dialog.activateWindow()
+            return
         start = self.settings.value("last_dir", "") or next(
             (d for d in DEFAULT_LOG_DIRS if os.path.isdir(d)), ""
         )
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择战斗日志", start, "Combat logs (WoWCombatLog*.txt);;All (*)"
-        )
-        if path:
-            self.settings.setValue("last_dir", str(Path(path).parent))
-            self.open_log(path, source="open")
+        if self._log_dialog is None:
+            dialog = QFileDialog(self)
+            # Native Windows getOpenFileName blocks the caller through shell cleanup
+            # and suspends Qt timers. Use the Qt picker and the normal event loop.
+            dialog.setOptions(
+                QFileDialog.Option.DontUseNativeDialog | QFileDialog.Option.DontUseCustomDirectoryIcons
+            )
+            dialog.setWindowTitle("选择战斗日志")
+            dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+            dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+            dialog.setViewMode(QFileDialog.ViewMode.List)
+            dialog.setNameFilters(["战斗日志 (WoWCombatLog*.txt)", "所有文件 (*)"])
+            for label, text in (
+                (QFileDialog.DialogLabel.LookIn, "位置："),
+                (QFileDialog.DialogLabel.FileName, "文件名："),
+                (QFileDialog.DialogLabel.FileType, "文件类型："),
+                (QFileDialog.DialogLabel.Accept, "打开"),
+                (QFileDialog.DialogLabel.Reject, "取消"),
+            ):
+                dialog.setLabelText(label, text)
+            dialog.finished.connect(self._on_log_dialog_finished)
+            self._log_dialog = dialog
+        if start:
+            self._log_dialog.setDirectory(str(start))
+        self._log_dialog.open()
+
+    def _on_log_dialog_finished(self, result: int) -> None:
+        dialog = self._log_dialog
+        if dialog is None or result != QFileDialog.DialogCode.Accepted:
+            return
+        paths = dialog.selectedFiles()
+        if not paths:
+            return
+        path = paths[0]
+        self.settings.setValue("last_dir", str(Path(path).parent))
+        # Reuse the hidden picker: destroying its filesystem model on every selection
+        # can wait for directory enumeration. Submit only after the picker has closed.
+        QTimer.singleShot(0, self, lambda: self.open_log(path, source="open"))
 
     def reload_log(self) -> None:
         if self.board.path and os.path.exists(self.board.path):
@@ -311,7 +345,7 @@ class MainWindow(QMainWindow):
             return
         client_id, secret, host = creds
         host = report_host(url) or host
-        self.settings.setValue("wcl_last_url", url)
+        self.wcl_panel.clear_url()
         for index, existing in enumerate(self.wcl_board.keys):
             if existing[1] == url and existing in self.wcl_board.loads.running:
                 self.wcl_board.activate(index)
@@ -330,7 +364,7 @@ class MainWindow(QMainWindow):
                 self.wcl_board.fail(k, short_error(tb), run_id=r),
                 self._refresh_wcl_quota(),
             ),
-            lambda frac, _msg, k=key, r=run_id: self.wcl_board.note_progress(k, frac, run_id=r),
+            lambda frac, msg, k=key, r=run_id: self.wcl_board.note_progress(k, frac, msg, run_id=r),
         )
         self.wcl_board.loads.bind(key, handle)
 

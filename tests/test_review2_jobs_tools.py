@@ -130,6 +130,7 @@ def test_source_entry_does_not_import_qt_in_spawn_child(tmp_path):
         """from wcl_replay.app import main
 from wcl_replay.workers import _serve, probe_job
 import multiprocessing
+from multiprocessing.reduction import ForkingPickler
 import json
 if __name__ == "__main__":
     multiprocessing.freeze_support()
@@ -141,8 +142,8 @@ if __name__ == "__main__":
         tasks.put((1, probe_job, ()))
         while True:
             message = results.get(timeout=10)
-            if message[0] == "done":
-                print(json.dumps(message[2]))
+            if message[0] == "done_bytes":
+                print(json.dumps(ForkingPickler.loads(message[2])))
                 break
             if message[0] == "fail":
                 raise RuntimeError(message[2])

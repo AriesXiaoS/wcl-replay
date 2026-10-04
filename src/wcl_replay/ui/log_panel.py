@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import json
+import time
+from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QRectF, QSettings, Qt, QTimer, Signal
@@ -324,6 +327,14 @@ class _SpinnerButton(QPushButton):
         painter.end()
 
 
+@dataclass(slots=True)
+class _RowState:
+    starred: bool = False
+    done: bool = False
+    progress: float | None = None
+    error: str | None = None
+
+
 class LogPanel(QFrame):
     """Open a combat log and list its pulls. Each row owns its own progress bar."""
 
@@ -333,6 +344,11 @@ class LogPanel(QFrame):
     activated = Signal(int)
     releaseRequested = Signal(int)
     starToggled = Signal(int)
+    pullsReady = Signal()
+
+    _SYNC_LIMIT = 64
+    _ROWS_PER_BATCH = 24
+    _BATCH_SECONDS = 0.008
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -342,6 +358,14 @@ class LogPanel(QFrame):
         self._selected: int | None = None
         self._has_file = False
         self._reading: str | None = None
+        self._list_generation = 0
+        self._labels: list[str] = []
+        self._row_states: dict[int, _RowState] = {}
+        self._populate = QTimer(self)
+        self._populate.timeout.connect(self._add_rows)
+        self._retired: deque[deque[_PullRow]] = deque()
+        self._dispose = QTimer(self)
+        self._dispose.timeout.connect(self._dispose_rows)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
@@ -405,42 +429,154 @@ class LogPanel(QFrame):
         self.status_lbl.setText(text)
 
     def set_pulls(self, labels: list[str]) -> None:
-        while self._list.count():
-            item = self._list.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
+        self._populate.stop()
+        self._list_generation += 1
+        if self._rows:
+            # Keep the body: taking/reparenting a large widget tree also repolishes
+            # all its children. Hide retired rows and dispose a few per event-loop turn.
+            while self._list.count() > 1:
+                item = self._list.takeAt(0)
+                item.widget().hide()
+            self._retired.append(deque(self._rows))
+            self._dispose.start()
         self._rows = []
         self._selected = None
-        for label in labels:
-            row = _PullRow(label, self._body)
-            row.clicked.connect(lambda r=row: self.activated.emit(self._rows.index(r)))
-            row.deleteClicked.connect(lambda r=row: self.releaseRequested.emit(self._rows.index(r)))
-            row.starClicked.connect(lambda r=row: self.starToggled.emit(self._rows.index(r)))
+        self._labels = list(labels)
+        self._row_states = {}
+        if len(labels) <= self._SYNC_LIMIT:
+            self._list.setEnabled(True)
+            self._body.setUpdatesEnabled(True)
+            self._body.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+            self._add_rows(bounded=False)
+        else:
+            # Recomputing every preceding row's wrapped-label height on every batch
+            # makes total population quadratic. Build first, then lay out once.
+            self._list.setEnabled(False)
+            self._body.setUpdatesEnabled(False)
+            self._body.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            self._populate.start()
+
+    def _add_rows(self, *, bounded: bool = True) -> None:
+        generation = self._list_generation
+        deadline = time.monotonic() + self._BATCH_SECONDS
+        count = 0
+        while len(self._rows) < len(self._labels):
+            index = len(self._rows)
+            row = _PullRow(self._labels[index], self._body)
+            for signal, action in (
+                (row.clicked, self.activated),
+                (row.deleteClicked, self.releaseRequested),
+                (row.starClicked, self.starToggled),
+            ):
+                signal.connect(lambda g=generation, i=index, a=action: self._emit_row_action(g, i, a))
             self._rows.append(row)
-            self._list.addWidget(row)
-        self._list.addStretch(1)
+            self._list.insertWidget(self._list.count() - 1, row)
+            self._apply_row_state(index)
+            count += 1
+            if bounded and (count >= self._ROWS_PER_BATCH or time.monotonic() >= deadline):
+                break
+        if len(self._rows) == len(self._labels):
+            self._populate.stop()
+            self._list.setEnabled(True)
+            self._body.setUpdatesEnabled(True)
+            self._body.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+            self.pullsReady.emit()
+
+    def _emit_row_action(self, generation: int, index: int, action) -> None:
+        # Signals queued by an old list must never address the new list's same index.
+        if generation == self._list_generation and 0 <= index < len(self._rows):
+            action.emit(index)
+
+    def _dispose_rows(self) -> None:
+        deadline = time.monotonic() + self._BATCH_SECONDS
+        count = 0
+        while self._retired:
+            rows = self._retired[0]
+            if not rows:
+                self._retired.popleft()
+                continue
+            row = rows.popleft()
+            row.deleteLater()
+            count += 1
+            if count >= self._ROWS_PER_BATCH or time.monotonic() >= deadline:
+                break
+        if not self._retired:
+            self._dispose.stop()
+
+    def _apply_row_state(self, index: int) -> None:
+        row = self._rows[index]
+        if index == self._selected:
+            row.set_selected(True)
+        state = self._row_states.get(index)
+        if state is None:
+            return
+        if state.starred:
+            row.set_starred(True)
+        if state.done:
+            row.mark_done()
+        elif state.error is not None:
+            row.mark_error(state.error)
+        elif state.progress is not None:
+            row.show_progress(state.progress)
+
+    def _state(self, index: int) -> _RowState | None:
+        if not 0 <= index < len(self._labels):
+            return None
+        return self._row_states.setdefault(index, _RowState())
+
+    def set_starred(self, index: int, on: bool) -> None:
+        if (state := self._state(index)) is None:
+            return
+        state.starred = on
+        if index < len(self._rows):
+            self._rows[index].set_starred(on)
 
     @property
     def rows(self) -> list[_PullRow]:
         return self._rows
 
     def set_selected(self, index: int | None) -> None:
+        previous = self._selected
         self._selected = index
-        for i, row in enumerate(self._rows):
-            row.set_selected(i == index)
+        if previous is not None and 0 <= previous < len(self._rows) and previous != index:
+            self._rows[previous].set_selected(False)
+        if index is not None and 0 <= index < len(self._rows):
+            self._rows[index].set_selected(True)
 
     def show_progress(self, index: int, frac: float) -> None:
-        self._rows[index].show_progress(frac)
+        if (state := self._state(index)) is None:
+            return
+        state.done, state.error, state.progress = False, None, frac
+        if index < len(self._rows):
+            self._rows[index].show_progress(frac)
 
     def mark_done(self, index: int) -> None:
-        self._rows[index].mark_done()
+        if (state := self._state(index)) is None:
+            return
+        state.done, state.error, state.progress = True, None, None
+        if index < len(self._rows):
+            self._rows[index].mark_done()
 
     def mark_error(self, index: int, message: str) -> None:
-        self._rows[index].mark_error(message)
+        if (state := self._state(index)) is None:
+            return
+        state.done, state.error, state.progress = False, message, None
+        if index < len(self._rows):
+            self._rows[index].mark_error(message)
 
     def clear_done(self, index: int) -> None:
-        self._rows[index].clear_done()
+        if (state := self._state(index)) is None:
+            return
+        state.done = False
+        if index < len(self._rows):
+            self._rows[index].clear_done()
+
+    def release_result(self, index: int) -> None:
+        if (state := self._state(index)) is None:
+            return
+        state.done, state.error, state.progress = False, None, None
+        if index < len(self._rows):
+            self._rows[index].release_result()
 
 
 class PullBoard:
@@ -467,6 +603,7 @@ class PullBoard:
         self.pinned = pins_from_settings(settings)
         self.panel.releaseRequested.connect(self.release)
         self.panel.starToggled.connect(self.toggle_pin)
+        self.panel.pullsReady.connect(self._on_pulls_ready)
         self.gen = 0
         self.path = ""
         self.entries: list[EncounterEntry] = []
@@ -504,15 +641,18 @@ class PullBoard:
         self._drop_stale(path)
         self.panel.set_status(f"{len(entries)} 次遭遇战")
         self.panel.set_pulls([pull_label(entry) for entry in self.entries])
-        self.panel.set_reading(None)
         for key, index in self._index.items():
             if key in self.pinned:
-                self.panel.rows[index].set_starred(True)
+                self.panel.set_starred(index, True)
             if key in self.loads.cache:
                 self.panel.mark_done(index)
             elif key in self.loads.running:
                 self.panel.show_progress(index, 0.0)
         self._restore_selection()
+
+    def _on_pulls_ready(self) -> None:
+        if self._listed:
+            self.panel.set_reading(None)
 
     def toggle_pin(self, index: int) -> None:
         if not 0 <= index < len(self.keys):
@@ -522,7 +662,7 @@ class PullBoard:
             self.pinned.discard(key)
         else:
             self.pinned.add(key)
-        self.panel.rows[index].set_starred(key in self.pinned)
+        self.panel.set_starred(index, key in self.pinned)
         self._save_pins()
 
     def index_failed(self, gen: int, message: str) -> None:
@@ -584,7 +724,7 @@ class PullBoard:
         if self.loads.selected == key:
             self.loads.selected = None
             self.panel.set_selected(None)
-        self.panel.rows[index].release_result()
+        self.panel.release_result(index)
 
     def trim_to_limit(self, keep: tuple | None = None) -> None:
         """Forget finished pulls past the cap, oldest calculation first."""

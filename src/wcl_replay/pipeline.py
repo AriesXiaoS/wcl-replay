@@ -26,8 +26,7 @@ def analyze(
     module = module_for(data.fight.encounter_id)
     if progress:
         progress(0.95, f"分析机制（{module.name}）")
-    analysis = module.analyze(data, tracks)
-    analysis.apply_parameters(parameters if parameters is not None else analysis.parameter_values)
+    analysis = module.analyze_with_parameters(data, tracks, parameters)
     for name, error in discovery_errors().items():
         analysis.log.append(
             LogEntry(

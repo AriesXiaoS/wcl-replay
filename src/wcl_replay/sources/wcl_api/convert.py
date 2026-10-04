@@ -215,6 +215,11 @@ def convert(
                 if not lst or lst[-1] != sample:
                     lst.append(sample)
 
+    # Selected event streams can omit an inactive participant. Keep the fight's full roster,
+    # registering missing players last so existing event actor ids remain unchanged.
+    for wid in fight.get("friendlyPlayers") or []:
+        actors.get(int(wid), None)
+
     events.sort(key=lambda e_: e_.t)
     for lst in samples.values():
         lst.sort(key=lambda s: s.t)

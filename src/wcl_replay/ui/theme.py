@@ -42,6 +42,8 @@ QScrollArea#logList, QWidget#logViewport, QWidget#logListBody {{ background: tra
 QFrame#logCard QLabel {{ background: transparent; }}
 QFrame#pullRow {{ background: transparent; border: none; border-radius: 6px; }}
 QFrame#pullRow[selected="true"] {{ background: #3a3150; }}
+QWidget#wclMeter {{ background: transparent; border: none; }}
+QLabel#meterCaption {{ color: {TEXT_DIM}; background: transparent; }}
 QFrame#stackPanel {{ background: rgba(14, 15, 19, 217); border: 1px solid {BORDER}; border-radius: 8px; }}
 QWidget#stackColumn {{ background: transparent; border: none; }}
 QFrame#stackCard {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 6px; }}

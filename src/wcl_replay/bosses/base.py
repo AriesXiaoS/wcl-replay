@@ -608,6 +608,20 @@ class BossModule:
         an.log = an.default_log()
         return an
 
+    def analyze_with_parameters(
+        self,
+        data: FightData,
+        tracks: Tracks,
+        parameters: Mapping[str, ParameterValue] | None = None,
+    ) -> Analysis:
+        """Build a configured result, retaining compatibility with existing ``analyze`` hooks.
+
+        Expensive modules can override this to build derived data with final parameters once.
+        """
+        analysis = self.analyze(data, tracks)
+        analysis.apply_parameters(parameters if parameters is not None else analysis.parameter_values)
+        return analysis
+
     def wcl_slices(self, report: dict, fight: dict) -> tuple[WclSlice, ...]:
         """Events to download for this boss. The default is enough to draw units and deaths."""
         del report, fight

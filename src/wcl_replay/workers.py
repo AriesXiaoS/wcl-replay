@@ -32,6 +32,7 @@ def worker_count() -> int:
 
 
 def index_log_job(path: str, progress: ProgressFn) -> list[EncounterEntry]:
+    progress(0.0, "正在读取轮次…")
     return index_log(path, lambda frac: progress(frac, "正在读取轮次…"))
 
 
@@ -67,12 +68,50 @@ def test_credentials_job(client_id: str, client_secret: str, host: str, progress
         client.close()
 
 
+# fetch_fight uses 0.84 as "events are in hand". analyze() then reports 0.9 and 0.95
+# on that same shared scale. The two bars below each run from 0 to 1.
+_DOWNLOAD_COMPLETE = 0.84
+
+
+def _download_bar(frac: float) -> float:
+    return min(1.0, max(0.0, frac / _DOWNLOAD_COMPLETE))
+
+
+def _compute_bar(frac: float) -> float:
+    if frac >= 1.0:
+        return 1.0
+    if frac >= 0.95:
+        return 0.7
+    if frac >= 0.9:
+        return 0.35
+    return 0.0
+
+
+def _phase(name: str, detail: str = "") -> str:
+    return f"phase:{name}:{detail}" if detail else f"phase:{name}"
+
+
 def fetch_wcl_job(url: str, client_id: str, client_secret: str, host: str, progress: ProgressFn) -> tuple:
     """Download one WCL fight and analyse it. Credentials stay arguments; this module does not read Qt settings."""
     from .sources.wcl_api.fetch import fetch_fight
 
-    data = fetch_fight(client_id, client_secret, host, url, lambda frac, msg: progress(frac * 0.84, msg))
-    tracks, analysis = analyze(data, progress)
+    def report(phase: str, frac: float, detail: str = "") -> None:
+        progress(frac, _phase(phase, detail))
+
+    data = fetch_fight(
+        client_id,
+        client_secret,
+        host,
+        url,
+        lambda frac, msg: report("download", _download_bar(frac), msg),
+    )
+    report("download", 1.0)
+
+    def on_compute(frac: float, msg: str = "") -> None:
+        report("compute", _compute_bar(frac), msg)
+
+    tracks, analysis = analyze(data, on_compute)
+    report("compute", 1.0)
     return data, tracks, analysis
 
 
@@ -116,7 +155,11 @@ def _serve(tasks: Queue, results: Queue, cancellations=None) -> None:
         finally:
             cancel_check.reset(token)
         try:
-            ForkingPickler.dumps(("done", job_id, result))
-            results.put(("done", job_id, result))
+            # Validate once and send those bytes. Queue's feeder must not walk the
+            # potentially large analysis object a second time.
+            payload = bytes(ForkingPickler.dumps(result))
+            results.put(("done_bytes", job_id, payload))
         except Exception:
             results.put(("fail", job_id, traceback.format_exc()))
+        finally:
+            result = payload = None

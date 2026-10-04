@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import threading
 import time
 
@@ -11,10 +12,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from fixture_jobs import crash_worker
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from wcl_replay.ui import loader
 from wcl_replay.ui.loader import TaskRunner
+from wcl_replay.ui.log_panel import LogPanel
 from wcl_replay.workers import probe_job
 
 
@@ -172,3 +175,110 @@ def test_shutdown_tolerates_a_closed_results_queue_while_listener_is_reading(app
         release.set()
         runner.shutdown()
         listener.join(timeout=5.0)
+
+
+def _slow_listener_start(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    real_start = threading.Thread.start
+    queues, procs = [], []
+
+    class FakeQueue(queue.Queue):
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+        def cancel_join_thread(self):
+            pass
+
+    class FakeProcess:
+        exitcode = None
+
+        def start(self):
+            pass
+
+        def terminate(self):
+            self.exitcode = 0
+
+        def join(self, **kwargs):
+            pass
+
+        def is_alive(self):
+            return self.exitcode is None
+
+    class FakeContext:
+        def Queue(self):
+            result = FakeQueue()
+            queues.append(result)
+            return result
+
+        def Process(self, **kwargs):
+            result = FakeProcess()
+            procs.append(result)
+            return result
+
+    def start(thread):
+        if thread.name == "wcl-replay-results":
+            entered.set()
+            assert release.wait(5.0)
+        return real_start(thread)
+
+    monkeypatch.setattr(loader.multiprocessing, "get_context", lambda _method: FakeContext())
+    monkeypatch.setattr(loader, "worker_count", lambda: 1)
+    monkeypatch.setattr(threading.Thread, "start", start)
+    return entered, release, queues, procs
+
+
+def test_slow_listener_start_does_not_block_submission_or_the_loading_spinner(app, monkeypatch):
+    entered, release, _queues, _procs = _slow_listener_start(monkeypatch)
+    runner = TaskRunner()
+    panel = LogPanel()
+    panel.set_reading("open")
+    ticks, failed = [], []
+    timer = QTimer()
+    timer.setInterval(10)
+    timer.timeout.connect(lambda: ticks.append(1))
+    # Unblock even the buggy implementation so a failure cannot hang the test process.
+    watchdog = threading.Timer(1.0, release.set)
+    try:
+        runner._ensure_pool()
+        assert _wait(app, entered.is_set)
+        watchdog.start()
+        handle = runner.run(probe_job, (), lambda _: None, failed.append)
+        assert not release.is_set(), "GUI submission waited for the listener's startup"
+        assert handle is not None and not handle.done
+        assert runner._tasks is None
+        angle = panel.open_btn._angle
+        timer.start()
+        assert _wait(app, lambda: len(ticks) >= 5 and panel.open_btn._angle != angle)
+        assert not release.is_set()
+        handle.cancel()
+        assert handle.done and failed == ["任务已取消"]
+    finally:
+        watchdog.cancel()
+        release.set()
+        assert _wait(app, lambda: not runner._booting)
+        timer.stop()
+        panel.set_reading(None)
+        panel.deleteLater()
+        runner.shutdown()
+
+
+def test_shutdown_during_slow_listener_start_returns_and_closes_the_unpublished_pool(app, monkeypatch):
+    entered, release, queues, procs = _slow_listener_start(monkeypatch)
+    runner = TaskRunner()
+    watchdog = threading.Timer(1.0, release.set)
+    try:
+        runner._ensure_pool()
+        assert _wait(app, entered.is_set)
+        watchdog.start()
+        runner.shutdown()
+        assert not release.is_set(), "GUI shutdown waited for the listener's startup"
+        release.set()
+        assert _wait(app, lambda: queues and all(q.closed for q in queues))
+        assert all(proc.exitcode == 0 for proc in procs)
+        assert not runner._booting and runner._tasks is None and not runner._procs
+    finally:
+        watchdog.cancel()
+        release.set()
+        runner.shutdown()

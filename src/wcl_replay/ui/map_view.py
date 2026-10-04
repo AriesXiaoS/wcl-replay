@@ -172,6 +172,8 @@ class MapView(QWidget):
         self._hits = {}
         s = self.ctl.session
         if s is None:
+            self._blink.stop()
+            self.update()
             return
         if s.analysis.arena and all(math.isfinite(v) for v in s.analysis.arena):
             self._bounds = s.analysis.arena
@@ -237,10 +239,14 @@ class MapView(QWidget):
     def _pick(self, pos: QPointF) -> None:
         hit: int | None = None
         best = 0.0
-        for aid, (center, radius) in self._hits.items():
+        # Actual unit bodies follow the paint order; the small click margin uses the nearest center.
+        for aid, (center, radius) in reversed(self._hits.items()):
             dx = pos.x() - center.x()
             dy = pos.y() - center.y()
             dist = dx * dx + dy * dy
+            if dist <= radius**2:
+                self.ctl.select(aid)
+                return
             if dist <= (radius + 3) ** 2 and (hit is None or dist < best):
                 hit = aid
                 best = dist

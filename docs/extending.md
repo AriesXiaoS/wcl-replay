@@ -31,6 +31,9 @@ class ExampleAnalysis(Analysis):
 
 `pipeline.analyze(data, parameters={...})` 支持无界面配置；返回时声明的参数必须与已生成模型一致。
 管线先应用声明的默认参数或传入值，再调用 `Analysis.refresh_indexes()` 排序日志、阶段并同步框架光环。
+管线通过 `BossModule.analyze_with_parameters(data, tracks, parameters)` 构造结果；默认实现仍调用原有
+`analyze(data, tracks)`，再应用参数。计算成本较高的首领可覆盖该接口，把最终参数传入结果构造器，
+在参数确定后只生成一次派生数据，避免先按默认值生成再重算。返回的参数与模型必须一致。
 首领类直接构造结果时也应在阶段模型初始化完成后应用默认值，避免把正确性依赖放到界面初始化中。
 覆盖 `apply_parameters` 时允许重建日志、时间轴、图层和图元；界面通过 `analysisChanged` 同步这些结果，
 保留播放位置、单位选择、相机缩放和已有图层开关。新增图层使用自身的 `default_on`。

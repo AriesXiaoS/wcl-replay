@@ -3,4 +3,4 @@
 
 """WCL replay: combat log / Warcraft Logs replay with per-boss mechanic analysis."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

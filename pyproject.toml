@@ -1,6 +1,6 @@
 [project]
 name = "wcl-replay"
-version = "0.1.0"
+version = "0.1.1"
 description = "Warcraft Logs / combat log replay and boss mechanic analysis (PySide6)"
 readme = "README.md"
 license = "PolyForm-Noncommercial-1.0.0"

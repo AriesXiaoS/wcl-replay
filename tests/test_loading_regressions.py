@@ -253,7 +253,7 @@ def test_wcl_retry_rejects_old_completion_failure_and_progress(app):
     board.note_progress(key, 0.9, run_id=old_id)
     board.fail(key, "stale error", run_id=old_id)
     assert not board.finish(key, _session("old"), "old", run_id=old_id)
-    assert panel.rows[0].bar.value() == 400
+    assert panel.rows[0].download.bar.value() == 400
     assert panel.rows[0].mark.text() == ""
     assert panel.rows[0].err.isHidden()
     assert key in board.loads.running
@@ -305,11 +305,72 @@ def test_main_window_restarts_a_cleared_or_failed_wcl_row_with_fresh_callbacks(w
     old.progress(0.9, "old progress")
     old.fail("old error")
     old.done(_result("old"))
-    assert win.wcl_panel.rows[0].bar.value() == 400
+    assert win.wcl_panel.rows[0].download.bar.value() == 400
     assert win.wcl_panel.rows[0].mark.text() == ""
     current.done(_result("retry"))
     assert win.ctl.session.data.source == "retry"
     assert win.wcl_panel.rows[0].mark.text() == "✓"
+
+
+def test_fetch_wcl_job_reports_download_and_compute_on_separate_scales(monkeypatch):
+    notes: list[tuple[float, str]] = []
+
+    def fake_fetch(client_id, client_secret, host, url, progress=None):
+        progress(0.42, "盘卷祭坛 · 伤害… 10 条")
+        progress(0.84, "使用本地事件缓存")
+        return "data"
+
+    def fake_analyze(data, progress):
+        assert data == "data"
+        progress(0.9, "构建坐标轨迹")
+        progress(0.95, "分析机制（盘卷祭坛）")
+        return "tracks", "analysis"
+
+    monkeypatch.setattr("wcl_replay.sources.wcl_api.fetch.fetch_fight", fake_fetch)
+    monkeypatch.setattr("wcl_replay.workers.analyze", fake_analyze)
+    result = fetch_wcl_job("url", "id", "secret", "host", lambda frac, msg="": notes.append((frac, msg)))
+    assert result == ("data", "tracks", "analysis")
+    assert notes == [
+        (0.5, "phase:download:盘卷祭坛 · 伤害… 10 条"),
+        (1.0, "phase:download:使用本地事件缓存"),
+        (1.0, "phase:download"),
+        (0.35, "phase:compute:构建坐标轨迹"),
+        (0.7, "phase:compute:分析机制（盘卷祭坛）"),
+        (1.0, "phase:compute"),
+    ]
+
+
+def test_query_clears_the_url_field(window):
+    win, runner = window
+    win.wcl_panel.set_url(URL)
+    win.query_wcl(URL)
+    assert win.wcl_panel.url() == ""
+    assert runner.jobs[-1].fn is fetch_wcl_job
+    assert win.settings.value("wcl_last_url", "") in ("", None)
+
+    win.wcl_panel.set_url(URL)
+    win.query_wcl(URL)
+    assert win.wcl_panel.url() == ""
+    assert len(runner.jobs) == 1
+
+
+def test_rejected_url_stays_in_the_field(window, messages):
+    win, runner = window
+    win.wcl_panel.set_url("https://example.com/nope")
+    win.query_wcl("https://example.com/nope")
+    assert win.wcl_panel.url() == "https://example.com/nope"
+    assert runner.jobs == []
+    assert messages and messages[-1][0] == "链接无效"
+
+
+def test_saved_fight_url_is_not_restored(app, settings, monkeypatch):
+    settings.setValue("wcl_last_url", URL)
+    monkeypatch.setattr(main_window, "TaskRunner", lambda _parent: _ManualRunner())
+    win = MainWindow(settings=settings)
+    assert win.wcl_panel.url() == ""
+    win.close()
+    win.deleteLater()
+    app.processEvents()
 
 
 @pytest.fixture

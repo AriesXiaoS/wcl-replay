@@ -65,7 +65,10 @@ def test_wcl_rows_accumulate_and_a_background_result_stays_cached():
 
     _index, first = board.begin("https://cn.warcraftlogs.com/reports/ya73XMW2TkvcnRQV?fight=3")
     assert first in board.loads.running
-    assert panel.rows[0].bar.isHidden() is False
+    assert panel.rows[0].download.host.isHidden() is False
+    assert panel.rows[0].compute.host.isHidden() is False
+    assert panel.rows[0].download.bar.value() == 0
+    assert panel.rows[0].compute.bar.value() == 0
 
     _index, second = board.begin("https://cn.warcraftlogs.com/reports/ya73XMW2TkvcnRQV?fight=4")
     assert len(panel.rows) == 2
@@ -121,3 +124,34 @@ def test_a_pinned_wcl_fight_stays_when_the_cache_is_cleared():
     panel.rows[0].delete_btn.click()
     assert board.loads.cache == {}
     assert key not in board.pinned
+
+
+def test_wcl_row_splits_download_and_compute_progress():
+    QApplication.instance() or QApplication([])
+    ctl = ReplayController()
+    panel = WclPanel()
+    board = WclBoard(ctl, panel)
+    _index, key = board.begin("https://cn.warcraftlogs.com/reports/ya73XMW2TkvcnRQV?fight=3")
+    row = panel.rows[0]
+
+    board.note_progress(key, 0.4, "phase:download:读取报告…")
+    assert row.download.bar.value() == 400
+    assert row.download.percent.text() == "40%"
+    assert row.download.bar.toolTip() == "读取报告…"
+    assert row.compute.bar.value() == 0
+    assert row.compute.percent.text() == "0%"
+
+    board.note_progress(key, 1.0, "phase:download")
+    board.note_progress(key, 0.35, "phase:compute:构建坐标轨迹")
+    assert row.download.bar.value() == 1000
+    assert row.download.percent.text() == "100%"
+    assert row.compute.bar.value() == 350
+    assert row.compute.percent.text() == "35%"
+    assert row.compute.bar.toolTip() == "构建坐标轨迹"
+    assert row.download.host.isHidden() is False
+    assert row.compute.host.isHidden() is False
+
+    assert board.finish(key, _session(), "一场") is True
+    assert row.download.host.isHidden() is True
+    assert row.compute.host.isHidden() is True
+    assert row.mark.text() == "✓"
