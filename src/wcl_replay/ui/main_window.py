@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+from functools import partial
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QTimer
@@ -87,6 +88,7 @@ class MainWindow(QMainWindow):
         self.wcl_panel.clearClicked.connect(self.wcl_board.clear_cache)
         self.wcl_panel.quotaRefreshRequested.connect(self._refresh_wcl_quota)
         self.wcl_panel.activated.connect(self._on_wcl_activated)
+        self.wcl_panel.reloadRequested.connect(self._on_wcl_reload)
 
         self._build_body()
         self._shortcuts()
@@ -299,23 +301,29 @@ class MainWindow(QMainWindow):
             != CredentialsDialog.DialogCode.Accepted
         ):
             return None
+        self._refresh_wcl_quota()
         return self._stored_credentials()
 
     def edit_wcl_credentials(self) -> None:
-        CredentialsDialog(self.settings, self, runner=self.tasks).exec()
+        previous = self._stored_credentials()
+        accepted = (
+            CredentialsDialog(self.settings, self, runner=self.tasks).exec()
+            == CredentialsDialog.DialogCode.Accepted
+        )
+        if accepted and self._stored_credentials() != previous:
+            self._refresh_wcl_quota()
 
     def _refresh_wcl_quota(self) -> None:
+        self._quota_gen += 1
+        gen = self._quota_gen
         if self._quota_job is not None:
             self._quota_job.cancel()
             self._quota_job = None
         creds = self._stored_credentials()
-        self._quota_gen += 1
-        gen = self._quota_gen
         if creds is None:
             self.wcl_panel.set_quota("未设置 API")
             return
-        if self.wcl_panel.quota_lbl.text() in ("额度未刷新", "未设置 API", "额度读取失败"):
-            self.wcl_panel.set_quota("正在读取额度…")
+        self.wcl_panel.set_quota("正在读取额度…")
         client_id, secret, host = creds
         self._quota_job = self.tasks.run(
             rate_limit_job,
@@ -360,10 +368,13 @@ class MainWindow(QMainWindow):
         _index, key = self.wcl_board.begin(url)
         self._start_wcl(key, client_id, secret, host)
 
-    def _start_wcl(self, key: tuple, client_id: str, secret: str, host: str) -> None:
+    def _start_wcl(
+        self, key: tuple, client_id: str, secret: str, host: str, *, force_refresh: bool = False
+    ) -> None:
         run_id = self.wcl_board.loads.run_id(key)
+        job = partial(fetch_wcl_job, force_refresh=True) if force_refresh else fetch_wcl_job
         handle = self.tasks.run(
-            fetch_wcl_job,
+            job,
             (key[1], client_id, secret, host),
             lambda result, k=key, r=run_id: self._on_wcl(k, result, run_id=r),
             lambda tb, k=key, r=run_id: (
@@ -373,6 +384,18 @@ class MainWindow(QMainWindow):
             lambda frac, msg, k=key, r=run_id: self.wcl_board.note_progress(k, frac, msg, run_id=r),
         )
         self.wcl_board.loads.bind(key, handle)
+
+    def _on_wcl_reload(self, index: int) -> None:
+        if not 0 <= index < len(self.wcl_board.keys):
+            return
+        creds = self._credentials()
+        if creds is None:
+            return
+        key = self.wcl_board.reload(index)
+        if key is None:
+            return
+        client_id, secret, host = creds
+        self._start_wcl(key, client_id, secret, report_host(key[1]) or host, force_refresh=True)
 
     def _on_wcl(self, key: tuple, result: tuple, *, run_id: int | None = None) -> None:
         data, tracks, analysis = result

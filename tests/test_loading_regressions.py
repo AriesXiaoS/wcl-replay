@@ -315,7 +315,7 @@ def test_main_window_restarts_a_cleared_or_failed_wcl_row_with_fresh_callbacks(w
 def test_fetch_wcl_job_reports_download_and_compute_on_separate_scales(monkeypatch):
     notes: list[tuple[float, str]] = []
 
-    def fake_fetch(client_id, client_secret, host, url, progress=None):
+    def fake_fetch(client_id, client_secret, host, url, progress=None, *, force_refresh=False):
         progress(0.42, "盘卷祭坛 · 伤害… 10 条")
         progress(0.84, "使用本地事件缓存")
         return "data"

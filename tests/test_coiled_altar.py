@@ -124,6 +124,30 @@ def test_cleave_aims_at_the_tank_when_logged_facing_points_elsewhere(fight_data)
     assert angle_diff(cone.direction, math.pi) > 1
 
 
+def test_absorbed_blighted_sever_still_aims_at_the_tank(fight_data):
+    boss = aid(fight_data, BOSS_GUID)
+    tank = aid(fight_data, TANK_GUID)
+    cast = next(
+        e for e in fight_data.events if e.spell_id == C.BLIGHTED_SEVER and e.type == "SPELL_CAST_SUCCESS"
+    )
+    cast.dst = -1
+    fight_data.events.append(
+        Event(cast.t + 4, "SPELL_ABSORBED", src=boss, dst=tank, spell_id=C.BLIGHTED_SEVER)
+    )
+    tracks, an = analyze(fight_data)
+    (blight,) = an.p1.blighted
+    assert blight.target == tank
+    origin = tracks.position(boss, blight.t - 1000)
+    dest = tracks.position(tank, blight.t - 1000)
+    cone = next(
+        p
+        for p in an.overlays_at(blight.t - 1000)
+        if isinstance(p, Cone) and p.radius == C.BLIGHTED_SEVER_RANGE
+    )
+    assert origin and dest
+    assert angle_diff(cone.direction, angle_to(origin, dest)) < 0.05
+
+
 def test_later_phases_draw_their_own_cleave(fight_data):
     _tracks, an = analyze(fight_data)
     soul = [p for p in an.overlays_at(21500) if isinstance(p, Cone)]

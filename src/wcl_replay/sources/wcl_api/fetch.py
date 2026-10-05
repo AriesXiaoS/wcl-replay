@@ -25,6 +25,7 @@ query($code: String!) {
       title
       startTime
       endTime
+      revision
       fights {
         id encounterID name difficulty kill startTime endTime size
         enemyNPCs { id gameID }
@@ -47,6 +48,8 @@ def fetch_fight(
     host: str,
     url: str,
     progress: Progress | None = None,
+    *,
+    force_refresh: bool = False,
 ) -> FightData:
     """Read one fight. ``host`` is the fallback when the link does not name a site."""
     code, fight_id = parse_report_url(url)
@@ -67,8 +70,20 @@ def fetch_fight(
         slices = module.wcl_slices(report, fight)
         if progress:
             progress(0.06, f"{module.name} · 准备查询")
-        raw = cached_events(client, client.host, code, fight, slices, module.name, progress)
         pulls = pull_numbers(report.get("fights") or [])
-        return convert(report, fight, raw, pulls.get(fight_id, 0), source=f"wcl:{code}#{fight_id}")
+        return cached_events(
+            client,
+            client.host,
+            code,
+            fight,
+            slices,
+            module.name,
+            progress,
+            revision=report.get("revision"),
+            force_refresh=force_refresh,
+            convert_events=lambda raw: convert(
+                report, fight, raw, pulls.get(fight_id, 0), source=f"wcl:{code}#{fight_id}"
+            ),
+        )
     finally:
         client.close()

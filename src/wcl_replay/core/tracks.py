@@ -222,6 +222,29 @@ class Tracks:
         pose = self.pose(actor_id, t)
         return (pose.x, pose.y) if pose is not None else None
 
+    def alive_spans(self, actor_id: int, start: int, end: int) -> tuple[tuple[int, int], ...]:
+        """Split a player's interval at deaths and battle resurrections.
+
+        Each end is a boundary pose of that life; a route may use it as its final point,
+        but must not connect it to the first point of the next life.
+        """
+        if end <= start or not self.has(actor_id):
+            return ()
+        lives = self._player_lives.get(actor_id)
+        if lives is None:
+            return ((start, end),)
+        observed = self.tracks[actor_id]
+        spans = []
+        for i, (lo, hi, death) in enumerate(lives):
+            if hi <= lo:
+                continue
+            life_start = start if i == 0 else int(observed.t[lo])
+            a = max(start, life_start)
+            b = min(end, death) if death is not None else end
+            if a < b:
+                spans.append((a, b))
+        return tuple(spans)
+
     def _npc_life_slice(self, tr: Track, actor_id: int, t: float) -> tuple[int, int]:
         """Sample range of the life that contains ``t``.
 
@@ -253,7 +276,9 @@ class Tracks:
         return lo, hi
 
     def appear_time(self, actor_id: int) -> int:
-        return self.spawn.get(actor_id, self.first_seen.get(actor_id, 0))
+        """Earliest appearance evidence, even if a reused instance has a later summon."""
+        first = self.first_seen.get(actor_id, 0)
+        return min(self.spawn.get(actor_id, first), first)
 
     def death_time(self, actor_id: int) -> int | None:
         d = self.deaths.get(actor_id)

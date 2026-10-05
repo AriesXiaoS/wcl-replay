@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 
+from ...core.cancellation import check_cancelled
 from ...core.markers import clip_world_markers
 from ...core.models import (
     FLAG_CONTROL_PLAYER,
@@ -29,6 +30,8 @@ from .index import EncounterEntry, marker_events
 from .timestamps import label_of, parse_ts_ms
 
 NO_GUID = ("0000000000000000", "nil", "")
+_READ_CHUNK = 256 * 1024
+_CANCEL_LINES = 1024
 
 # Event suffixes that carry the advanced parameter block.
 _ADV_SUFFIXES = (
@@ -183,35 +186,65 @@ def _int(s: str) -> int:
         return 0
 
 
+def _encounter_lines(
+    path: str | Path,
+    entry: EncounterEntry,
+    diagnose: Callable[[str], None],
+    progress: Callable[[float], None] | None,
+) -> Iterator[str]:
+    """Read only this pull, retaining at most one chunk and an unfinished line."""
+    check_cancelled()
+    size = entry.end_offset - entry.start_offset
+    digest = hashlib.blake2b(digest_size=16)
+    pending = b""
+    read = consumed = lines_since_check = 0
+    step = max(1, size // 100)
+    next_progress = step
+    if progress:
+        progress(0.0)
+    with open(path, "rb") as fh:
+        fh.seek(entry.start_offset)
+        while read < size:
+            check_cancelled()
+            block = fh.read(min(_READ_CHUNK, size - read))
+            if not block:
+                raise ValueError("这场战斗的日志内容已改变，请刷新列表后重新计算")
+            read += len(block)
+            digest.update(block)
+            lines = (pending + block).split(b"\n")
+            pending = lines.pop()
+            for raw_line in lines:
+                if lines_since_check >= _CANCEL_LINES:
+                    check_cancelled()
+                    lines_since_check = 0
+                consumed += len(raw_line) + 1
+                lines_since_check += 1
+                if progress and consumed >= next_progress:
+                    # Completion is published only after the content digest has been checked.
+                    progress(min(0.99, consumed / max(1, size)))
+                    next_progress = consumed + step
+                yield raw_line.decode("utf-8", "replace").rstrip("\r")
+        if pending:
+            if entry.closed:
+                yield pending.decode("utf-8", "replace").rstrip("\r")
+            else:
+                diagnose("末尾记录尚未写完，等待刷新补齐")
+    check_cancelled()
+    if entry.content_digest and digest.hexdigest() != entry.content_digest:
+        raise ValueError("这场战斗的日志内容已改变，请刷新列表后重新计算")
+
+
 def parse_encounter(
     path: str | Path,
     entry: EncounterEntry,
     progress: Callable[[float], None] | None = None,
 ) -> FightData:
-    with open(path, "rb") as fh:
-        fh.seek(entry.start_offset)
-        raw = fh.read(entry.end_offset - entry.start_offset)
-    if entry.content_digest and hashlib.blake2b(raw, digest_size=16).hexdigest() != entry.content_digest:
-        raise ValueError("这场战斗的日志内容已改变，请刷新列表后重新计算")
-    lines = raw.decode("utf-8", "replace").splitlines()
-    incomplete_tail = not entry.closed and raw and not raw.endswith(b"\n")
-    if incomplete_tail:
-        lines.pop()
-    del raw
-
     b = _Builder()
-    if incomplete_tail:
-        b.diagnose("末尾记录尚未写完，等待刷新补齐")
     events: list[Event] = []
     map_info = parse_map_change(entry.map_line) if entry.map_line else None
     start_ms: int | None = None
     last_t = 0
-    n = len(lines)
-    step = max(1, n // 100)
-
-    for li, line in enumerate(lines):
-        if progress and li % step == 0:
-            progress(li / n)
+    for line in _encounter_lines(path, entry, b.diagnose, progress):
         ts, sep, rest = line.partition("  ")
         if not sep:
             continue
@@ -292,9 +325,9 @@ def parse_encounter(
                     a.kind = ActorKind.PET
         events.append(e)
 
+    check_cancelled()
     events.sort(key=lambda ev_: ev_.t)
-    if progress:
-        progress(1.0)
+    check_cancelled()
     fight = Fight(
         id=entry.seq,
         encounter_id=entry.encounter_id,
@@ -317,6 +350,9 @@ def parse_encounter(
             fight.duration_ms,
             entry.instance_id,
         )
+    check_cancelled()
+    if progress:
+        progress(1.0)
     return FightData(
         fight=fight,
         actors=b.actors,

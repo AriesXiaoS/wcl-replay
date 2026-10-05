@@ -24,20 +24,25 @@ from typing import BinaryIO
 
 from ...core.cancellation import check_cancelled
 from ...core.difficulty import DIFFICULTY_LABELS
-from ...core.markers import MarkerEvent, clip_world_markers
+from ...core.markers import MarkerEvent, clip_world_markers_many
 from ...core.models import WorldMarker
 from ...storage import cache_dir as cache_dir
 from ...storage import cache_warning, write_json
 from .fields import split_fields
 from .timestamps import parse_ts_ms
 
-INDEX_VERSION = 9
+INDEX_VERSION = 10
 
 # Report progress through a long scan. One mmap.find over a multi-gigabyte log would not
 # publish a fraction until it returned.
 _SCAN_CHUNK = 8 * 1024 * 1024
 _CANCEL_LINES = 1024
 _CANCEL_BYTES = 256 * 1024
+_INDEX_ATTEMPTS = 2
+
+
+class _SnapshotChanged(ValueError):
+    """The file stopped describing the snapshot an indexing attempt was reading."""
 
 
 @dataclass(slots=True)
@@ -130,6 +135,38 @@ def _metadata_matches(cached: dict, stat: os.stat_result, change_time: int | Non
         and cached.get("size") == stat.st_size
         and cached.get("mtime_ns") == stat.st_mtime_ns
     )
+
+
+def _ensure_snapshot(
+    path: Path,
+    stat: os.stat_result,
+    change_time: int | None,
+    *,
+    digest: str | None = None,
+    progress: Callable[[float], None] | None = None,
+    verify_prefix: bool = False,
+) -> None:
+    """Accept live suffix appends only after verifying the scanned prefix stayed unchanged."""
+    try:
+        current, current_change = _file_metadata(path)
+    except FileNotFoundError as exc:
+        raise _SnapshotChanged from exc
+    identity = (stat.st_dev, stat.st_ino)
+    same_identity = (current.st_dev, current.st_ino) == identity
+    unchanged = (
+        same_identity
+        and current.st_size == stat.st_size
+        and current.st_mtime_ns == stat.st_mtime_ns
+        and current_change == change_time
+    )
+    if unchanged and not verify_prefix:
+        return
+    if same_identity and (current.st_size > stat.st_size or unchanged) and digest is not None:
+        if _prefix_digest(path, stat.st_size, progress) == digest:
+            after, _after_change = _file_metadata(path)
+            if (after.st_dev, after.st_ino) == identity and after.st_size >= current.st_size:
+                return
+    raise _SnapshotChanged
 
 
 def _cache_file(path: Path) -> Path:
@@ -500,9 +537,45 @@ def _number_pulls(entries: list[EncounterEntry]) -> None:
 
 
 def index_log(path: str | Path, progress: Callable[[float], None] | None = None) -> list[EncounterEntry]:
-    check_cancelled()
     path = Path(path)
-    st, change_time = _file_metadata(path)
+    last_progress = 0.0
+
+    def publish(fraction: float) -> None:
+        nonlocal last_progress
+        # A retry restarts the work, but never sends the UI backwards or completes early.
+        last_progress = max(last_progress, min(0.99, fraction))
+        if progress:
+            progress(last_progress)
+
+    for _attempt in range(_INDEX_ATTEMPTS):
+        check_cancelled()
+        st, change_time = _file_metadata(path)
+        try:
+            entries = _index_snapshot(path, st, change_time, publish if progress else None)
+        except _SnapshotChanged:
+            continue
+        except (OSError, ValueError):
+            # A concurrent replacement/truncation can fail a read before the final check.
+            # Keep ordinary I/O/format errors visible when the snapshot itself is unchanged.
+            try:
+                _ensure_snapshot(path, st, change_time)
+            except _SnapshotChanged:
+                continue
+            raise
+        check_cancelled()
+        if progress:
+            progress(1.0)
+        return entries
+    check_cancelled()
+    raise ValueError("日志在建立索引时发生变化，请稍后刷新")
+
+
+def _index_snapshot(
+    path: Path,
+    st: os.stat_result,
+    change_time: int | None,
+    progress: Callable[[float], None] | None,
+) -> list[EncounterEntry]:
     cf = _cache_file(path)
     entries: list[EncounterEntry] = []
     markers: list[MarkerEvent] = []
@@ -513,9 +586,14 @@ def index_log(path: str | Path, progress: Callable[[float], None] | None = None)
             if cached.get("version") == INDEX_VERSION and "markers" in cached:
                 old = [_entry_from_cache(e) for e in cached["entries"]]
                 if _metadata_matches(cached, st, change_time):
+                    _ensure_snapshot(
+                        path,
+                        st,
+                        change_time,
+                        digest=cached["digest"],
+                        progress=(lambda frac: progress(frac * 0.99)) if progress else None,
+                    )
                     check_cancelled()
-                    if progress:
-                        progress(1.0)
                     return old
                 unchanged = (
                     cached.get("identity") == [st.st_dev, st.st_ino]
@@ -526,6 +604,13 @@ def index_log(path: str | Path, progress: Callable[[float], None] | None = None)
                     )
                 )
                 if unchanged and cached["size"] == st.st_size:
+                    _ensure_snapshot(
+                        path,
+                        st,
+                        change_time,
+                        digest=cached["digest"],
+                        progress=(lambda frac: progress(0.2 + frac * 0.79)) if progress else None,
+                    )
                     check_cancelled()
                     if (
                         cached.get("mtime_ns") != st.st_mtime_ns
@@ -538,8 +623,6 @@ def index_log(path: str | Path, progress: Callable[[float], None] | None = None)
                             write_json(cf, cached)
                         except OSError as exc:
                             cache_warning(exc)
-                    if progress:
-                        progress(1.0)
                     return old
                 if unchanged and cached["size"] < st.st_size:
                     # Log grew: keep closed encounters, rescan from the first open one.
@@ -549,16 +632,22 @@ def index_log(path: str | Path, progress: Callable[[float], None] | None = None)
                         entries.append(e)
                     resume_from = entries[-1].end_offset if entries else 0
                     markers = [MarkerEvent(**m) for m in cached["markers"] if m["offset"] < resume_from]
+    except _SnapshotChanged:
+        raise
     except (OSError, ValueError, KeyError, TypeError):
         entries, markers, resume_from = [], [], 0
 
+    # Hash before scanning, so live growth can be distinguished from a prefix rewrite.
+    # Stable files retain one full-prefix hash when change time is available. A second
+    # read is needed for growth during this attempt or unsupported metadata queries.
+    digest = _prefix_digest(path, st.st_size, (lambda frac: progress(0.2 + frac * 0.2)) if progress else None)
     if st.st_size > 0:
-        with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+        with open(path, "rb") as fh, mmap.mmap(fh.fileno(), st.st_size, access=mmap.ACCESS_READ) as mm:
             if progress is None:
                 scan_progress = marker_progress = None
             else:
-                scan_progress = _scale_progress(progress, 0.2, 0.5, resume_from, st.st_size)
-                marker_progress = _scale_progress(progress, 0.5, 0.8, resume_from, st.st_size)
+                scan_progress = _scale_progress(progress, 0.4, 0.6, resume_from, st.st_size)
+                marker_progress = _scale_progress(progress, 0.6, 0.8, resume_from, st.st_size)
             _scan(mm, resume_from, entries, scan_progress)
             markers.extend(_scan_markers(mm, resume_from, marker_progress))
             _mark_zone_unloads(mm, markers)
@@ -572,11 +661,15 @@ def index_log(path: str | Path, progress: Callable[[float], None] | None = None)
                         entry.content_digest = hashlib.blake2b(
                             view[entry.start_offset : entry.end_offset], digest_size=16
                         ).hexdigest()
-                    entry.marker_snapshot = tuple(
-                        clip_world_markers(
-                            markers, parse_ts_ms(entry.start_ts), entry.duration_ms, entry.instance_id
-                        )
-                    )
+                snapshots = clip_world_markers_many(
+                    markers,
+                    [
+                        (parse_ts_ms(entry.start_ts), entry.duration_ms, entry.instance_id)
+                        for entry in entries
+                    ],
+                )
+                for entry, snapshot in zip(entries, snapshots, strict=True):
+                    entry.marker_snapshot = tuple(snapshot)
                     entry.analysis_digest = _analysis_digest(entry)
             finally:
                 view.release()
@@ -589,12 +682,19 @@ def index_log(path: str | Path, progress: Callable[[float], None] | None = None)
         "mtime_ns": st.st_mtime_ns,
         "change_time_ns": change_time,
         "identity": [st.st_dev, st.st_ino],
-        "digest": _prefix_digest(
-            path, st.st_size, (lambda frac: progress(0.8 + frac * 0.2)) if progress else None
-        ),
+        "digest": digest,
         "entries": [asdict(e) for e in entries],
         "markers": [asdict(m) for m in markers],
     }
+    _ensure_snapshot(
+        path,
+        st,
+        change_time,
+        digest=digest,
+        progress=(lambda frac: progress(0.8 + frac * 0.2)) if progress else None,
+        verify_prefix=change_time is None,
+    )
+    check_cancelled()
     try:
         write_json(cf, payload)
     except OSError as exc:

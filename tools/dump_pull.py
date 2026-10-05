@@ -54,6 +54,8 @@ def main() -> None:
             )
         return
 
+    if not 1 <= args.seq <= len(entries):
+        ap.error(f"seq must be between 1 and {len(entries)}")
     entry = entries[args.seq - 1]
     t0 = time.perf_counter()
     data = parse_encounter(args.log, entry)

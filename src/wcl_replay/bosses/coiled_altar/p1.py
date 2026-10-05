@@ -233,28 +233,34 @@ class P1Model:
         return out
 
     def _blighted_target(self, t: int) -> int:
+        hit = self._impact_player({C.BLIGHTED_SEVER}, t)
+        return hit if hit >= 0 else self._melee_target(t)
+
+    def _impact_player(self, spell_ids: set[int], t: int) -> int:
+        """First player the frontal actually reached. A full absorb or miss is still the tank."""
+        kinds = ("SPELL_AURA_APPLIED", "SPELL_DAMAGE", "SPELL_MISSED", "SPELL_ABSORBED")
         for e in events_between(self.data, self.times, t - 20, t + 300):
-            if (
-                e.spell_id == C.BLIGHTED_SEVER
-                and e.type in ("SPELL_AURA_APPLIED", "SPELL_DAMAGE")
-                and self._is_player(e.dst)
-            ):
+            if e.spell_id in spell_ids and e.type in kinds and self._is_player(e.dst):
                 return e.dst
         return -1
+
+    def _melee_target(self, t: int) -> int:
+        """Who the boss was auto-attacking at t. Cast lines for the cleave name no one."""
+        found = -1
+        for e in self.data.events:
+            if e.t > t:
+                break
+            if e.src == self.boss and e.type in ("SWING_DAMAGE", "SWING_MISSED") and self._is_player(e.dst):
+                found = e.dst
+        return found
 
     def _is_player(self, aid: int) -> bool:
         actor = self.data.actors.get(aid)
         return actor is not None and actor.is_player
 
     def _sever_target(self, t: int) -> int:
-        for e in events_between(self.data, self.times, t - 20, t + 300):
-            if (
-                e.spell_id in (C.SEVER_DEBUFF, C.SEVER)
-                and e.type in ("SPELL_AURA_APPLIED", "SPELL_DAMAGE")
-                and e.dst >= 0
-            ):
-                return e.dst
-        return -1
+        hit = self._impact_player({C.SEVER_DEBUFF, C.SEVER}, t)
+        return hit if hit >= 0 else self._melee_target(t)
 
     def _soak_done(self, iv: Interval) -> bool:
         """The mark fell. An aura still up at the wipe is clamped to the fight end and has no result."""
@@ -540,21 +546,28 @@ class P1Model:
             return Seg("转阶段时引爆", C.C_PHASE, badge=True)
         return Seg("留在地上", "#888888", badge=True)
 
-    def _carry_routes(self) -> list[tuple[Carry, tuple[tuple[int, float, float], ...]]]:
+    def _carry_routes(self) -> list[tuple[Carry, int, int, tuple[tuple[int, float, float], ...]]]:
         out = []
         for c in self.carries:
-            pts = movement_times(self.tracks.track(c.player), c.start, c.end)
-            if pts:
-                out.append((c, pts))
+            for start, end in self.tracks.alive_spans(c.player, c.start, c.end):
+                pts = movement_times(
+                    self.tracks.track(c.player),
+                    start,
+                    end,
+                    position_at=lambda t, player=c.player: self.tracks.position(player, t),
+                )
+                if pts:
+                    out.append((c, start, end, pts))
         return out
 
     def route_overlays(self, t: float) -> list[Path]:
         """Dotted trail of a carry, grown up to t and removed the moment the debuff drops."""
         out = []
-        for c, samples in self._routes:
-            if not c.start <= t < c.end:
+        for c, start, end, samples in self._routes:
+            if not c.start <= t < c.end or t < start:
                 continue
-            pts = trail_points(samples, t, self.tracks.position(c.player, t))
+            tip = self.tracks.position(c.player, t) if t <= end else None
+            pts = trail_points(samples, min(t, end), tip)
             if pts:
                 out.append(Path(pts, COLOR_OF[c.color], C.PATH_WIDTH, C.PATH_ALPHA, True, "globules"))
         return out

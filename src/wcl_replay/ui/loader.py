@@ -118,18 +118,19 @@ class TaskRunner(QObject):
         self._ensure_pool()
         self._ids += 1
         job_id = self._ids
-        self._jobs[job_id] = _Job(on_done, on_fail, on_progress)
-        occupied = {job.slot for jid, job in self._jobs.items() if jid != job_id}
-        job = self._jobs[job_id]
+        occupied = {job.slot for job in self._jobs.values()}
+        job = _Job(on_done, on_fail, on_progress)
         job.slot = next(slot for slot in range(self.max_jobs) if slot not in occupied)
         self._cancellations[job.slot] = 0
         job.deadline = time.monotonic() + max(0.0, timeout)
+        with self._lock:
+            self._jobs[job_id] = job
         handle = JobHandle(self, job_id)
         item = (job_id, fn, args, job.slot)
         try:
             ForkingPickler.dumps(item)
         except Exception:
-            self._jobs.pop(job_id, None)
+            self._take_job(job_id)
             on_fail(traceback.format_exc())
             return
         with self._lock:
@@ -148,7 +149,7 @@ class TaskRunner(QObject):
                 if tasks is None:
                     self._pending.append(item)
         if closed or boot_error:
-            self._jobs.pop(job_id, None)
+            self._take_job(job_id)
             on_fail("已关闭" if closed else boot_error or "已关闭")
             return
         if tasks is None:
@@ -156,23 +157,37 @@ class TaskRunner(QObject):
         try:
             tasks.put(item)
         except Exception:
-            self._jobs.pop(job_id, None)
+            self._take_job(job_id)
             on_fail(traceback.format_exc())
             return None
         return handle
 
     def cancel(self, job_id: int, message: str = "任务已取消") -> None:
-        job = self._jobs.get(job_id)
-        if job is None or job.cancelled:
-            return
-        job.cancelled = True
-        self._cancellations[job.slot] = 1
         with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.cancelled:
+                return
+            job.cancelled = True
+            self._cancellations[job.slot] = 1
             pending = any(item[0] == job_id for item in self._pending)
             self._pending = [item for item in self._pending if item[0] != job_id]
-        if pending:
-            self._jobs.pop(job_id, None)
+            if pending:
+                self._jobs.pop(job_id, None)
         job.on_fail(message)
+
+    def _take_job(self, job_id: int) -> _Job | None:
+        with self._lock:
+            return self._jobs.pop(job_id, None)
+
+    def _accept_result(self, job_id: int) -> bool:
+        """Reject stale payloads before decoding, but acknowledge a stopped worker's slot."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            accepted = not self._closed and job is not None and not job.cancelled
+        if not accepted and job is not None:
+            # Keep the slot occupied until this queued acknowledgement reaches the GUI.
+            self._done.emit(job_id, None)
+        return accepted
 
     def _expire(self) -> None:
         if self._closed:
@@ -366,24 +381,35 @@ class TaskRunner(QObject):
                 return
             if msg is None:
                 return
-            kind = msg[0]
-            if kind == "progress":
-                _kind, job_id, frac, text = msg
-                self._progress.emit(job_id, frac, text)
-            elif kind == "done":
-                _kind, job_id, result = msg
+            try:
+                self._deliver(msg)
+            finally:
+                # Queue the GUI notification without retaining its payload while idle.
+                msg = None
+
+    def _deliver(self, msg: tuple) -> None:
+        """Keep decoded results scoped to one message, until the GUI consumes its signal."""
+        kind = msg[0]
+        if kind == "progress":
+            _kind, job_id, frac, text = msg
+            self._progress.emit(job_id, frac, text)
+        elif kind == "done":
+            _kind, job_id, result = msg
+            if self._accept_result(job_id):
                 self._done.emit(job_id, result)
-            elif kind == "done_bytes":
-                _kind, job_id, payload = msg
-                try:
-                    result = ForkingPickler.loads(payload)
-                except Exception:
-                    self._failed.emit(job_id, traceback.format_exc())
-                else:
-                    self._done.emit(job_id, result)
-            elif kind == "fail":
-                _kind, job_id, tb = msg
-                self._failed.emit(job_id, tb)
+        elif kind == "done_bytes":
+            _kind, job_id, payload = msg
+            if not self._accept_result(job_id):
+                return
+            try:
+                result = ForkingPickler.loads(payload)
+            except Exception:
+                self._failed.emit(job_id, traceback.format_exc())
+            else:
+                self._done.emit(job_id, result)
+        elif kind == "fail":
+            _kind, job_id, tb = msg
+            self._failed.emit(job_id, tb)
 
     @Slot(str)
     def _on_pool_failed(self, message: str) -> None:
@@ -400,7 +426,7 @@ class TaskRunner(QObject):
             self._tasks = self._results = None
             self._procs = []
             self._listener = None
-        jobs, self._jobs = self._jobs, {}
+            jobs, self._jobs = self._jobs, {}
         for job in jobs.values():
             if not job.cancelled:
                 job.on_fail(message)
@@ -413,12 +439,12 @@ class TaskRunner(QObject):
 
     @Slot(int, object)
     def _on_done(self, job_id: int, result: object) -> None:
-        job = self._jobs.pop(job_id, None)
-        if job is not None and not job.cancelled:
+        job = self._take_job(job_id)
+        if job is not None and not job.cancelled and not self._closed:
             job.on_done(result)
 
     @Slot(int, str)
     def _on_failed(self, job_id: int, tb: str) -> None:
-        job = self._jobs.pop(job_id, None)
-        if job is not None and not job.cancelled:
+        job = self._take_job(job_id)
+        if job is not None and not job.cancelled and not self._closed:
             job.on_fail(tb)

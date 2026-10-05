@@ -216,7 +216,7 @@ class CoiledAltarAnalysis(Analysis):
         self._melee_t: dict[int, list[int]] = {}
         self._melee_dst: dict[int, list[int]] = {}
         for aid, rows in swings.items():
-            rows.sort()
+            rows.sort(key=lambda row: row[0])
             self._melee_t[aid] = [stamp for stamp, _dst in rows]
             self._melee_dst[aid] = [dst for _stamp, dst in rows]
 
@@ -274,9 +274,9 @@ class CoiledAltarAnalysis(Analysis):
     def _styles(self) -> dict[int, UnitStyle]:
         styles: dict[int, UnitStyle] = {}
         for a in self.data.actors_by_npc(C.NPC_ZULJAN):
-            styles[a.id] = UnitStyle("#c0392b", 15, "祖尔加", "#ffb0a0", show_facing=True, hp_bar=True)
+            styles[a.id] = UnitStyle("#c0392b", 15, "祖尔加", "#ffb0a0", hp_bar=True)
         for a in self.data.actors_by_npc(C.NPC_MALACRASS):
-            styles[a.id] = UnitStyle("#8e44ad", 15, "玛拉卡斯", "#e0b0ff", show_facing=True, hp_bar=True)
+            styles[a.id] = UnitStyle("#8e44ad", 15, "玛拉卡斯", "#e0b0ff", hp_bar=True)
         if self.p2:
             styles.update(self.p2.unit_styles())
         return styles

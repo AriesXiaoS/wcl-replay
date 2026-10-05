@@ -33,6 +33,7 @@ class CredentialsDialog(QDialog):
         self.tasks = runner or TaskRunner(self)
         self._owns_runner = runner is None
         self._test_generation = 0
+        self._test_values: tuple[str, str, str] | None = None
         self.finished.connect(self._finished)
         self.setWindowTitle("WCL API 设置")
         self.setMinimumWidth(460)
@@ -90,8 +91,8 @@ class CredentialsDialog(QDialog):
             return
         self._test_generation += 1
         generation = self._test_generation
-        self.test_btn.setEnabled(False)
-        self.test_btn.setText("正在测试…")
+        self._test_values = self._values()
+        self._set_testing(True)
         self._test_job = self.tasks.run(
             test_credentials_job,
             (cid, sec, host),
@@ -102,19 +103,28 @@ class CredentialsDialog(QDialog):
     def _tested(self, generation: int, error: str | None = None) -> None:
         if generation != self._test_generation:
             return
-        self.test_btn.setEnabled(True)
-        self.test_btn.setText("测试连接")
+        self._set_testing(False)
+        tested_values, self._test_values = self._test_values, None
+        if self._values() != tested_values:
+            return
         if error:
             QMessageBox.warning(self, "连接失败", error.strip().splitlines()[-1])
         else:
             QMessageBox.information(self, "连接成功", "已成功获取 WCL API 访问令牌。")
 
+    def _set_testing(self, testing: bool) -> None:
+        for widget in (self.client_id, self.secret, self.host, self.test_btn):
+            widget.setEnabled(not testing)
+        self.test_btn.setText("正在测试…" if testing else "测试连接")
+
     def _finished(self, _result: int) -> None:
         self._test_generation += 1
+        self._test_values = None
         handle = getattr(self, "_test_job", None)
         if handle is not None:
             handle.cancel()
             self._test_job = None
+        self._set_testing(False)
         if self._owns_runner:
             self.tasks.shutdown()
 

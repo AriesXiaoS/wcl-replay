@@ -15,8 +15,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import ClassVar
 
-from ..core.models import ActorKind, FightData
+from ..core.models import ActorKind, Event, FightData
 from ..core.specs import class_color
+from ..core.targets import Targets
 from ..core.tracks import Tracks
 
 # ---------------------------------------------------------------------------- map primitives
@@ -293,7 +294,10 @@ def aura_intervals(
     *,
     source_independent: bool = False,
 ) -> Intervals:
-    """Applied -> removed auras; opt into source identity for independently applied instances."""
+    """Aura presence intervals; opt into source identity for independently applied instances.
+
+    A first dose or refresh starts at that observation, without inventing an earlier application.
+    """
     ids = {spell_ids} if isinstance(spell_ids, int) else set(spell_ids)
     end_t = data.fight.duration_ms if end_t is None else end_t
     open_: dict[tuple[int, ...], Interval] = {}
@@ -302,10 +306,10 @@ def aura_intervals(
         if e.spell_id not in ids or (dst_filter and not dst_filter(e.dst)):
             continue
         key = (e.dst, e.spell_id, e.src) if source_independent else (e.dst, e.spell_id)
-        if e.type in ("SPELL_AURA_APPLIED", "SPELL_AURA_APPLIED_DOSE"):
-            # A dose on an aura that is already open is just another stack. A dose with no
-            # apply (WCL sometimes only emits the stack) still has to open the interval.
-            if e.type == "SPELL_AURA_APPLIED_DOSE" and key in open_:
+        if e.type in ("SPELL_AURA_APPLIED", "SPELL_AURA_APPLIED_DOSE", "SPELL_AURA_REFRESH"):
+            # A dose or refresh keeps an open aura continuous. Without an apply, it is still
+            # evidence that the aura is up, starting only at this observation.
+            if e.type in ("SPELL_AURA_APPLIED_DOSE", "SPELL_AURA_REFRESH") and key in open_:
                 continue
             if key in open_:
                 out.append(open_.pop(key))
@@ -433,7 +437,12 @@ class Analysis:
             for e in data.events
             if e.type == "UNIT_DIED" and e.dst in data.actors and data.actors[e.dst].is_player
         )
+        self._frame_events: list[Event] | None = None
+        self._frame_key: tuple | None = None
         self._index_frame_auras()
+        self._target_events: list[Event] | None = None
+        self._target_key: tuple | None = None
+        self._index_targets()
 
     # -- defaults -----------------------------------------------------------------------------
 
@@ -443,11 +452,27 @@ class Analysis:
             if parameter.id in values:
                 self.parameter_values[parameter.id] = parameter.normalize(values[parameter.id])
 
-    def refresh_indexes(self) -> None:
-        """Synchronize public result indexes after a parameter hook rebuilt the result."""
+    def refresh_indexes(self, *, invalidate_auras: bool = False) -> None:
+        """Refresh result indexes, reusing auras and targets when inputs have not changed.
+
+        Plugins that edit existing events in place must pass ``invalidate_auras=True``.
+        Replacing/appending events or changing aura declarations rebuilds the index automatically.
+        """
         self.log.sort(key=lambda entry: entry.t)
         self.phases.sort(key=lambda phase: phase.t)
+        if invalidate_auras:
+            self._frame_key = None
+            self._target_key = None
         self._index_frame_auras()
+        self._index_targets()
+
+    def _index_targets(self) -> None:
+        key = (len(self.data.events), frozenset(self.data.actors))
+        if self.data.events is self._target_events and key == self._target_key:
+            return
+        self.targets = Targets(self.data)
+        self._target_events = self.data.events
+        self._target_key = key
 
     @property
     def boss_ids(self) -> list[int]:
@@ -520,9 +545,13 @@ class Analysis:
         return x0 <= x <= x1 and y0 <= y <= y1
 
     def _index_frame_auras(self) -> None:
-        players = {actor.id for actor in self.data.players()}
+        players = frozenset(actor.id for actor in self.data.players())
+        declarations = tuple(self.frame_auras)
+        key = (len(self.data.events), self.data.fight.duration_ms, players, declarations)
+        if self.data.events is self._frame_events and key == self._frame_key:
+            return
         indexed: dict[str, Intervals] = {}
-        for aura in self.frame_auras:
+        for aura in declarations:
             spell_ids = {spell_id for spell_id, _icon in aura.spells}
             indexed[aura.key] = aura_intervals(
                 self.data,
@@ -531,6 +560,8 @@ class Analysis:
                 source_independent=aura.source_independent,
             )
         self._frame_iv = indexed
+        self._frame_events = self.data.events
+        self._frame_key = key
 
     def active_frame_auras(self, actor_id: int, t: float) -> tuple[tuple[str, str], ...]:
         """``(key, icon stem)`` for debuffs in ``frame_auras`` that are up on this player."""

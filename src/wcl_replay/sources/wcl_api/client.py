@@ -26,6 +26,7 @@ query($code: String!) {
       title
       startTime
       endTime
+      revision
       fights {
         id encounterID name difficulty kill startTime endTime size
         enemyNPCs { id gameID }
@@ -168,9 +169,10 @@ class WclClient:
 
     # -- reports ------------------------------------------------------------------------------
 
-    def report(self, code: str) -> dict:
+    def report(self, code: str, *, force_refresh: bool = False) -> dict:
+        check_cancelled()
         hit = self._reports.get(code)
-        if hit and time.time() - hit[0] < 300:
+        if not force_refresh and hit and 0 <= time.time() - hit[0] < 300:
             return hit[1]
         rep = self.query(REPORT_QUERY, {"code": code})["reportData"]["report"]
         if rep is None:
@@ -196,9 +198,14 @@ class WclClient:
         return download(self, code, fight, slices, progress=progress)
 
     def fight_data(
-        self, code: str, fight_id: int, progress: Callable[[float, str], None] | None = None
+        self,
+        code: str,
+        fight_id: int,
+        progress: Callable[[float, str], None] | None = None,
+        *,
+        force_refresh: bool = False,
     ) -> FightData:
-        rep = self.report(code)
+        rep = self.report(code, force_refresh=force_refresh)
         fight = next((f for f in rep.get("fights") or [] if int(f["id"]) == fight_id), None)
         if fight is None:
             raise WclError(f"报告 {code} 中没有 fight {fight_id}")
@@ -208,6 +215,17 @@ class WclClient:
         slices = tuple(
             WclSlice(view, "All", hostility=view, resources=True) for view in ("Friendlies", "Enemies")
         )
-        events = cached_events(self, self.host, code, fight, slices, progress=progress)
         pulls = pull_numbers(rep.get("fights") or [])
-        return convert(rep, fight, events, pulls.get(fight_id, 0), source=f"wcl:{code}#{fight_id}")
+        return cached_events(
+            self,
+            self.host,
+            code,
+            fight,
+            slices,
+            progress=progress,
+            revision=rep.get("revision"),
+            force_refresh=force_refresh,
+            convert_events=lambda raw: convert(
+                rep, fight, raw, pulls.get(fight_id, 0), source=f"wcl:{code}#{fight_id}"
+            ),
+        )

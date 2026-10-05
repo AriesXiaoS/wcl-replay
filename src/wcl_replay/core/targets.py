@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import bisect
 
+from .cancellation import check_cancelled
 from .models import FightData
 
 # Periodic damage and heals keep ticking whoever was dotted; they are not a new target.
@@ -34,13 +35,18 @@ class Targets:
         times: dict[int, list[int]] = {}
         dests: dict[int, list[int]] = {}
         actors = data.actors
-        for event in data.events:
+        for index, event in enumerate(data.events):
+            if index % 1024 == 0:
+                check_cancelled()
             if event.type not in _TARGET_EVENTS:
                 continue
             if event.src < 0 or event.dst < 0 or event.dst == event.src or event.dst not in actors:
                 continue
+            destinations = dests.setdefault(event.src, [])
+            if destinations and destinations[-1] == event.dst:
+                continue
             times.setdefault(event.src, []).append(event.t)
-            dests.setdefault(event.src, []).append(event.dst)
+            destinations.append(event.dst)
         self._times = times
         self._dests = dests
 

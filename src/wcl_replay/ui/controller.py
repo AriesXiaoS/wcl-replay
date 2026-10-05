@@ -24,7 +24,13 @@ class Session:
     targets: Targets = field(init=False)
 
     def __post_init__(self) -> None:
-        self.targets = Targets(self.data)
+        # Analysis is normally built in a worker; reuse its compact target index.
+        indexed = getattr(self.analysis, "targets", None)
+        self.targets = (
+            indexed
+            if isinstance(indexed, Targets) and getattr(self.analysis, "data", None) is self.data
+            else Targets(self.data)
+        )
 
     @property
     def duration(self) -> int:
@@ -72,6 +78,7 @@ class ReplayController(QObject):
         self._parameter_cache: dict[tuple[int, str], ParameterValue] = {}
         self._legacy_parameter_values: dict[str, ParameterValue] = {}
         self.session: Session | None = None
+        self.session_origin: tuple[str, tuple] | None = None
         self.active_source = "local"
         self.t = 0.0
         self.speed = 1.0
@@ -99,9 +106,10 @@ class ReplayController(QObject):
             self.active_source = source
             self.clear_session()
 
-    def set_session(self, session: Session) -> None:
+    def set_session(self, session: Session, *, origin: tuple[str, tuple] | None = None) -> None:
         self.pause()
         self.session = session
+        self.session_origin = origin
         self.t = 0.0
         self._push_parameters(session.analysis)
         self.layers = {lane.id: lane.default_on for lane in session.analysis.lanes}
@@ -112,9 +120,27 @@ class ReplayController(QObject):
             self.selectionChanged.emit()
         self.timeChanged.emit(self.t)
 
+    def show_session(self, session: Session, *, origin: tuple[str, tuple]) -> None:
+        """Reselecting the same cached replay keeps its time, playback and unit selection."""
+        if self.session is session:
+            self.session_origin = origin
+        else:
+            self.set_session(session, origin=origin)
+
+    def displayed_key(self, source: str, cache: Mapping[tuple, object]) -> tuple | None:
+        """Record ownership survives a background replacement of its cached Session."""
+        if self.session is None:
+            return None
+        if self.session_origin is not None:
+            owner_source, key = self.session_origin
+            return key if owner_source == source else None
+        # Standalone consumers may still install a cached replay without an origin.
+        return next((key for key, cached in cache.items() if self.session is cached), None)
+
     def clear_session(self) -> None:
         self.pause()
         self.session = None
+        self.session_origin = None
         self.parameter_values = {}
         self.layers = {}
         self.t = 0.0
@@ -247,6 +273,7 @@ class ReplayController(QObject):
             return
         analysis.apply_parameters(changed)
         analysis.refresh_indexes()
+        self.session.targets = analysis.targets
         self.layers = {lane.id: self.layers.get(lane.id, lane.default_on) for lane in analysis.lanes}
         self.parameter_values = dict(analysis.parameter_values)
         encounter_id = analysis.data.fight.encounter_id
@@ -286,6 +313,8 @@ class ReplayController(QObject):
             values[parameter.id] = value
         analysis.apply_parameters(values)
         analysis.refresh_indexes()
+        if self.session is not None and self.session.analysis is analysis:
+            self.session.targets = analysis.targets
         self.parameter_values = dict(analysis.parameter_values)
         for parameter_id, value in self.parameter_values.items():
             self._parameter_cache[encounter_id, parameter_id] = value

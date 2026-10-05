@@ -91,7 +91,15 @@ def _phase(name: str, detail: str = "") -> str:
     return f"phase:{name}:{detail}" if detail else f"phase:{name}"
 
 
-def fetch_wcl_job(url: str, client_id: str, client_secret: str, host: str, progress: ProgressFn) -> tuple:
+def fetch_wcl_job(
+    url: str,
+    client_id: str,
+    client_secret: str,
+    host: str,
+    progress: ProgressFn,
+    *,
+    force_refresh: bool = False,
+) -> tuple:
     """Download one WCL fight and analyse it. Credentials stay arguments; this module does not read Qt settings."""
     from .sources.wcl_api.fetch import fetch_fight
 
@@ -104,6 +112,7 @@ def fetch_wcl_job(url: str, client_id: str, client_secret: str, host: str, progr
         host,
         url,
         lambda frac, msg: report("download", _download_bar(frac), msg),
+        force_refresh=force_refresh,
     )
     report("download", 1.0)
 
@@ -144,22 +153,21 @@ def _serve(tasks: Queue, results: Queue, cancellations=None) -> None:
             check()
             _report(results, _job, frac, msg)
 
+        result = payload = None
         token = cancel_check.set(check)
         try:
             check()
             result = fn(*args, progress)
             check()
-        except Exception:
-            results.put(("fail", job_id, traceback.format_exc()))
-            continue
-        finally:
-            cancel_check.reset(token)
-        try:
             # Validate once and send those bytes. Queue's feeder must not walk the
             # potentially large analysis object a second time.
             payload = bytes(ForkingPickler.dumps(result))
+            # Cancellation can arrive during serialization; acknowledge it without
+            # transporting a result the GUI will discard.
+            check()
             results.put(("done_bytes", job_id, payload))
         except Exception:
             results.put(("fail", job_id, traceback.format_exc()))
         finally:
+            cancel_check.reset(token)
             result = payload = None

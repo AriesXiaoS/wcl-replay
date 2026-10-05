@@ -9,6 +9,7 @@ uv run python tools/snapshot.py LOG --seq 31 --at 16 203 --out snapshots
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from pathlib import Path
@@ -23,6 +24,8 @@ def main() -> None:
     ap.add_argument("--settings", help="optional isolated INI settings file")
     ap.add_argument("--options", default="names,hp", help="comma separated: names,player_hp,hp,key")
     args = ap.parse_args()
+    if any(not math.isfinite(sec) or sec < 0 for sec in args.at):
+        ap.error("at must contain finite, non-negative times")
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     os.environ.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")
 
@@ -52,13 +55,23 @@ def main() -> None:
         win.ctl.set_option(key, key in args.options.split(","))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    used_names: set[str] = set()
     for sec in args.at:
         win.ctl.seek(sec * 1000)
         for _ in range(5):
             app.processEvents()
         win.status_panel._render()
         app.processEvents()
-        path = out / f"pull{entry.pull_number}_{int(sec):04d}.png"
+        seconds, milliseconds = divmod(round(sec * 1000), 1000)
+        stamp = f"{seconds:04d}" + (f"_{milliseconds:03d}" if milliseconds else "")
+        name = f"pull{entry.pull_number}_{stamp}"
+        unique = name
+        suffix = 2
+        while unique in used_names:
+            unique = f"{name}_{suffix}"
+            suffix += 1
+        used_names.add(unique)
+        path = out / f"{unique}.png"
         if not win.grab().save(str(path)):
             raise OSError(f"cannot save snapshot: {path}")
         print(path)

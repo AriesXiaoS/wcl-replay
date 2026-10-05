@@ -10,8 +10,12 @@ unit raid-target order (star, circle, diamond, ...).
 
 from __future__ import annotations
 
+import bisect
+import heapq
+from collections.abc import Iterable
 from dataclasses import dataclass
 
+from .cancellation import check_cancelled
 from .models import WorldMarker
 
 
@@ -56,6 +60,78 @@ def style_of(index: int) -> MarkerStyle:
 def _zone_unload_removes(events: list[MarkerEvent]) -> set[tuple[int, int]]:
     """Only the source's explicit zone-change context makes a removal non-authoritative."""
     return {(event.abs_ms, event.index) for event in events if not event.placed and event.zone_unload}
+
+
+@dataclass(frozen=True, slots=True)
+class _MarkerSpan:
+    start: int
+    end: int | None
+    x: float
+    y: float
+
+
+def _marker_spans(
+    ordered: Iterable[tuple[int, MarkerEvent]], unload: set[tuple[int, int]]
+) -> dict[int, list[_MarkerSpan]]:
+    open_: dict[int, MarkerEvent] = {}
+    spans: dict[int, list[_MarkerSpan]] = {}
+    for count, (_rank, event) in enumerate(ordered):
+        if count % 1024 == 0:
+            check_cancelled()
+        if not event.placed and (event.abs_ms, event.index) in unload:
+            continue
+        previous = open_.pop(event.index, None)
+        if previous is not None and event.abs_ms > previous.abs_ms:
+            spans.setdefault(event.index, []).append(
+                _MarkerSpan(previous.abs_ms, event.abs_ms, previous.x, previous.y)
+            )
+        if event.placed:
+            open_[event.index] = event
+    for index, event in open_.items():
+        spans.setdefault(index, []).append(_MarkerSpan(event.abs_ms, None, event.x, event.y))
+    return spans
+
+
+def clip_world_markers_many(
+    events: list[MarkerEvent], fights: list[tuple[int, int, int]]
+) -> list[list[WorldMarker]]:
+    """Clip many (start, duration, instance) windows without rescanning marker history per pull."""
+    check_cancelled()
+    unload = _zone_unload_removes(events)
+    grouped: dict[int, list[tuple[int, MarkerEvent]]] = {}
+    # Preserve supplied order when even the byte offsets tie.
+    for rank, event in enumerate(sorted(events, key=lambda event: (event.abs_ms, event.offset))):
+        grouped.setdefault(event.instance_id, []).append((rank, event))
+    timelines = {}
+    shared = grouped.get(0, [])
+    for instance in {instance for _start, _duration, instance in fights}:
+        ordered = (
+            shared
+            if instance == 0
+            else heapq.merge(shared, grouped.get(instance, []), key=lambda item: item[0])
+        )
+        timelines[instance] = {
+            index: ([span.start for span in spans], spans)
+            for index, spans in _marker_spans(ordered, unload).items()
+        }
+
+    results: list[list[WorldMarker]] = []
+    for start, duration, instance in fights:
+        check_cancelled()
+        out: list[WorldMarker] = []
+        end = start + max(0, duration)
+        if duration > 0:
+            for index, (starts, spans) in timelines[instance].items():
+                at = max(0, bisect.bisect_right(starts, start) - 1)
+                while at < len(spans) and spans[at].start < end:
+                    span = spans[at]
+                    if span.end is None or span.end > start:
+                        until = duration + 1 if span.end is None or span.end > end else span.end - start
+                        out.append(WorldMarker(index, span.x, span.y, max(0, span.start - start), until))
+                    at += 1
+        out.sort(key=lambda marker: (marker.start, marker.index))
+        results.append(out)
+    return results
 
 
 def clip_world_markers(

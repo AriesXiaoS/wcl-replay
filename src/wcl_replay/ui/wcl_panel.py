@@ -85,6 +85,8 @@ class _Meter:
 class _WclRow(_PullRow):
     """Fight row with a download bar and a separate calculation bar."""
 
+    reloadClicked = Signal()
+
     def __init__(
         self,
         label: str,
@@ -95,6 +97,13 @@ class _WclRow(_PullRow):
     ):
         super().__init__(label, parent, action_tip=action_tip, star_tip=star_tip)
         lay = self.layout()
+        self.reload_btn = QPushButton("↻")
+        self.reload_btn.setObjectName("rowReload")
+        self.reload_btn.setFixedSize(18, 18)
+        self.reload_btn.setToolTip("重新下载最新战斗数据并重新计算；完成前可以继续回放当前数据")
+        self.reload_btn.clicked.connect(self.reloadClicked.emit)
+        top = lay.itemAt(0).layout()
+        top.insertWidget(top.count() - 2, self.reload_btn)
         lay.removeWidget(self.bar)
         self.bar.setParent(None)
         self.download = _Meter("下载", "下载这场战斗的日志")
@@ -162,12 +171,14 @@ class WclPanel(QFrame):
     activated = Signal(int)
     removeRequested = Signal(int)
     starToggled = Signal(int)
+    reloadRequested = Signal(int)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("logCard")
         self.setMinimumWidth(340)
         self._rows: list[_WclRow] = []
+        self._selected_row: _WclRow | None = None
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
@@ -243,14 +254,22 @@ class WclPanel(QFrame):
         """Insert a row at the top. The click reports wherever that row sits when it is clicked."""
         stretch = self._list.takeAt(self._list.count() - 1)
         row = _WclRow(label, self._body)
-        row.clicked.connect(lambda r=row: self.activated.emit(self._rows.index(r)))
-        row.deleteClicked.connect(lambda r=row: self.removeRequested.emit(self._rows.index(r)))
-        row.starClicked.connect(lambda r=row: self.starToggled.emit(self._rows.index(r)))
+        for signal, action in (
+            (row.clicked, self.activated),
+            (row.deleteClicked, self.removeRequested),
+            (row.starClicked, self.starToggled),
+            (row.reloadClicked, self.reloadRequested),
+        ):
+            signal.connect(lambda r=row, a=action: self._emit_row_action(r, a))
         self._rows.insert(0, row)
         self._list.insertWidget(0, row)
         self._list.addItem(stretch)
         self._scroll.verticalScrollBar().setValue(0)
         return 0
+
+    def _emit_row_action(self, row: _WclRow, action) -> None:
+        if row in self._rows:
+            action.emit(self._rows.index(row))
 
     @property
     def rows(self) -> list[_WclRow]:
@@ -261,8 +280,15 @@ class WclPanel(QFrame):
         self._rows[index].text.setToolTip(label)
 
     def set_selected(self, index: int | None) -> None:
-        for i, row in enumerate(self._rows):
-            row.set_selected(i == index)
+        selected = self._rows[index] if index is not None and 0 <= index < len(self._rows) else None
+        previous = self._selected_row
+        if selected is previous:
+            return
+        self._selected_row = selected
+        if previous is not None:
+            previous.set_selected(False)
+        if selected is not None:
+            selected.set_selected(True)
 
     def reset_progress(self, index: int) -> None:
         self._rows[index].reset_progress()
@@ -284,6 +310,8 @@ class WclPanel(QFrame):
 
     def remove_row(self, index: int) -> None:
         row = self._rows.pop(index)
+        if row is self._selected_row:
+            self._selected_row = None
         self._list.removeWidget(row)
         row.setParent(None)
         row.deleteLater()
@@ -333,12 +361,21 @@ class WclBoard:
         action = self.loads.click(key)
         if action == "show" and self.active():
             cached = self.loads.cache[key]
-            if self.ctl.session is not cached:
-                self.ctl.set_session(cached)
+            self.ctl.show_session(cached, origin=("wcl", key))
         elif action == "start":
             self.panel.reset_progress(index)
         self.trim_to_limit()
         return action
+
+    def reload(self, index: int) -> tuple | None:
+        """Restart one record with a new callback token, keeping its previous replay usable."""
+        if not 0 <= index < len(self.keys):
+            return None
+        key = self.keys[index]
+        self.loads.restart(key)
+        self.panel.set_selected(index)
+        self.panel.reset_progress(index)
+        return key
 
     def note_progress(self, key: tuple, frac: float, message: str = "", *, run_id: int | None = None) -> None:
         if key not in self.keys or not self.loads.is_current(key, run_id):
@@ -358,7 +395,7 @@ class WclBoard:
         self.panel.set_label(index, label)
         self.panel.mark_done(index)
         if show:
-            self.ctl.set_session(session)
+            self.ctl.set_session(session, origin=("wcl", key))
         self.trim_to_limit()
         return show
 
@@ -370,13 +407,14 @@ class WclBoard:
             cap = 0
         if cap == 0:
             return
+        displayed = self.ctl.displayed_key("wcl", self.loads.cache)
         for key in list(self.loads.order):
             if len(self.loads.cache) <= cap:
                 break
             if key in self.pinned or key in self.loads.running or key == self.loads.selected:
                 continue
             cached = self.loads.cache.get(key)
-            if cached is None or self.ctl.session is cached:
+            if cached is None or key == displayed:
                 continue
             del self.loads.cache[key]
             self.loads.forget_order(key)
@@ -399,12 +437,13 @@ class WclBoard:
         if not 0 <= index < len(self.keys):
             return
         key = self.keys.pop(index)
+        displayed = self.ctl.displayed_key("wcl", self.loads.cache)
         self.pinned.discard(key)
-        session = self.loads.cache.pop(key, None)
+        self.loads.cache.pop(key, None)
         self.loads.abandon(key)
         if self.loads.selected == key:
             self.loads.selected = None
-        if session is not None and self.ctl.session is session:
+        if displayed == key:
             self.ctl.clear_session()
         self.panel.remove_row(index)
         if self.loads.selected in self.keys:
@@ -415,6 +454,7 @@ class WclBoard:
 
     def clear_cache(self) -> None:
         """Drop finished results. A pinned fight, and one that is still computing, stay."""
+        displayed = self.ctl.displayed_key("wcl", self.loads.cache)
         self.loads.cache = {key: session for key, session in self.loads.cache.items() if key in self.pinned}
         self.loads.order = [
             key for key in self.loads.order if key in self.loads.running or key in self.loads.cache
@@ -423,8 +463,8 @@ class WclBoard:
             if self.loads.selected not in self.loads.running:
                 self.loads.selected = None
                 self.panel.set_selected(None)
-            if self.active():
-                self.ctl.clear_session()
+        if self.active() and displayed is not None and displayed not in self.loads.cache:
+            self.ctl.clear_session()
         for index, key in enumerate(self.keys):
             if key not in self.loads.running and key not in self.loads.cache:
                 self.panel.clear_done(index)
@@ -443,5 +483,5 @@ class WclBoard:
             return
         self.panel.set_selected(self.keys.index(key))
         cached = self.loads.cache.get(key)
-        if self.active() and cached is not None and self.ctl.session is not cached:
-            self.ctl.set_session(cached)
+        if self.active() and cached is not None:
+            self.ctl.show_session(cached, origin=("wcl", key))

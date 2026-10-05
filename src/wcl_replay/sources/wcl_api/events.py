@@ -8,6 +8,8 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import math
+import time
 import zlib
 from collections import Counter
 from collections.abc import Callable
@@ -15,11 +17,13 @@ from dataclasses import asdict
 from typing import Protocol
 
 from ...bosses.base import WclSlice
+from ...core.cancellation import check_cancelled
 from ...storage import cache_dir, cache_warning, write_json
 from .client import WclError
 
 Progress = Callable[[float, str], None]
-CACHE_VERSION = 2
+CACHE_VERSION = 3
+CACHE_TTL_SECONDS = 24 * 3600
 EVENTS_QUERY = """
 query($code: String!, $fight: [Int]!, $start: Float!, $end: Float!, $kind: EventDataType,
       $hostility: HostilityType, $resources: Boolean!, $filter: String) {
@@ -41,7 +45,7 @@ class QueryClient(Protocol):
     def query(self, q: str, variables: dict) -> dict: ...
 
 
-def cached_events(
+def cached_events[T](
     client: QueryClient,
     host: str,
     code: str,
@@ -49,34 +53,78 @@ def cached_events(
     slices: tuple[WclSlice, ...],
     boss: str = "WCL",
     progress: Progress | None = None,
-) -> list[dict]:
+    *,
+    revision: int | None = None,
+    force_refresh: bool = False,
+    convert_events: Callable[[list[dict]], T] | None = None,
+) -> list[dict] | T:
+    """Reuse raw events, accepting/saving them only after the optional conversion succeeds."""
+    check_cancelled()
     identity = [host, code, int(fight["id"]), [asdict(slice_) for slice_ in slices]]
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     path = cache_dir() / "wcl" / "events" / f"{key}.json.gz"
     time_range = [fight["startTime"], fight["endTime"]]
-    try:
-        with gzip.open(path, "rt", encoding="utf-8") as file:
-            blob = json.load(file)
-        if (
-            isinstance(blob, dict)
-            and blob.get("version") == CACHE_VERSION
-            and blob.get("range") == time_range
+    if not force_refresh:
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as file:
+                blob = json.load(file)
+            check_cancelled()
+            now = time.time()
+            fetched_at = blob.get("fetched_at") if isinstance(blob, dict) else None
+            if (
+                isinstance(blob, dict)
+                and blob.get("version") == CACHE_VERSION
+                and blob.get("range") == time_range
+                and blob.get("revision") == revision
+                and type(fetched_at) in (int, float)
+                and math.isfinite(fetched_at)
+                and 0 < fetched_at <= now
+                and now - fetched_at < CACHE_TTL_SECONDS
+            ):
+                events = blob["events"]
+                if isinstance(events, list) and all(isinstance(event, dict) for event in events):
+                    result = convert_events(events) if convert_events else events
+                    check_cancelled()
+                    if progress:
+                        progress(0.84, "使用本地事件缓存")
+                    return result
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            OverflowError,
+            IndexError,
+            AttributeError,
+            EOFError,
+            zlib.error,
         ):
-            events = blob["events"]
-            if isinstance(events, list) and all(isinstance(event, dict) for event in events):
-                if progress:
-                    progress(0.84, "使用本地事件缓存")
-                return events
-    except (OSError, ValueError, KeyError, TypeError, EOFError, zlib.error):
-        pass
+            pass
     events = download(client, code, fight, slices, boss, progress)
+    check_cancelled()
     try:
-        write_json(path, {"version": CACHE_VERSION, "range": time_range, "events": events}, compressed=True)
+        result = convert_events(events) if convert_events else events
+    except (ValueError, KeyError, TypeError, OverflowError, IndexError, AttributeError) as exc:
+        raise WclError("WCL 事件数据格式错误，请稍后重试") from exc
+    # A failed/cancelled conversion must never replace a previously usable cache.
+    check_cancelled()
+    try:
+        write_json(
+            path,
+            {
+                "version": CACHE_VERSION,
+                "range": time_range,
+                "revision": revision,
+                "fetched_at": time.time(),
+                "events": events,
+            },
+            compressed=True,
+        )
     except OSError as exc:
         cache_warning(exc)
         if progress:
             progress(0.84, "下载完成；缓存未保存，本次仍可分析")
-    return events
+    return result
 
 
 def download(

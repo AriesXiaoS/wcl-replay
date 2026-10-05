@@ -28,11 +28,12 @@ QTextBrowser {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 
 QFrame#logCard {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 8px; }}
 QPushButton#modeBtn {{ padding: 3px 12px; }}
 QPushButton#modeBtn:checked {{ background: #3a3150; border-color: {ACCENT}; }}
-QPushButton#rowDelete, QPushButton#rowStar {{
+QPushButton#rowDelete, QPushButton#rowStar, QPushButton#rowReload {{
     padding: 0; min-width: 18px; max-width: 18px; min-height: 18px; max-height: 18px;
     border: none; background: transparent; color: {TEXT_DIM};
 }}
 QPushButton#rowDelete:hover {{ color: #e07070; background: transparent; }}
+QPushButton#rowReload:hover {{ color: {ACCENT}; background: transparent; }}
 QPushButton#rowStar:hover, QPushButton#rowStar[starred="true"] {{ color: #e8b84d; background: transparent; }}
 QListWidget {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 8px; outline: none; }}
 QListWidget::item {{ padding: 8px 10px; }}

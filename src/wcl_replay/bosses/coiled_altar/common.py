@@ -5,25 +5,41 @@ from __future__ import annotations
 
 import bisect
 import math
+from collections.abc import Callable
 
 from ...core.models import FightData
 from ...core.specs import class_color
 from ..base import Seg
 
 
-def movement_times(track, t0: int, t1: int, step: float = 1.5) -> tuple[tuple[int, float, float], ...]:
-    """Thinned (time, x, y) samples from t0 to t1, so a trail can be cut at the playhead."""
+def movement_times(
+    track,
+    t0: int,
+    t1: int,
+    step: float = 1.5,
+    *,
+    position_at: Callable[[int], tuple[float, float] | None] | None = None,
+) -> tuple[tuple[int, float, float], ...]:
+    """Thinned samples from t0 to t1, optionally using a life-aware position lookup."""
     if track is None or len(track) == 0 or t1 <= t0:
         return ()
-    raw = [(t0, *track.position(t0))]
+    point_at = position_at or track.position
+    start = point_at(t0)
+    if start is None:
+        return ()
+    raw = [(t0, *start)]
     for i in range(len(track)):
         ts = int(track.t[i])
         if ts <= t0:
             continue
         if ts >= t1:
             break
-        raw.append((ts, float(track.x[i]), float(track.y[i])))
-    raw.append((t1, *track.position(t1)))
+        point = position_at(ts) if position_at is not None else (float(track.x[i]), float(track.y[i]))
+        if point is not None:
+            raw.append((ts, *point))
+    end = point_at(t1)
+    if end is not None:
+        raw.append((t1, *end))
     kept = [raw[0]]
     limit = step * step
     for ts, x, y in raw[1:-1]:

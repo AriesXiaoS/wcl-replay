@@ -134,10 +134,20 @@ class PullLoads:
         self.remember(key)
         return self.selected == key
 
+    def restart(self, key: tuple) -> None:
+        """Start a fresh attempt while keeping a finished session available for replay."""
+        self.abandon(key)
+        self.selected = key
+        self.running.add(key)
+        self._seq += 1
+        self._run_ids[key] = self._seq
+        self.remember(key)
+
     def abandon(self, key: tuple) -> None:
         self.running.discard(key)
         self._run_ids.pop(key, None)
-        self.forget_order(key)
+        if key not in self.cache:
+            self.forget_order(key)
         handle = self._handles.pop(key, None)
         if handle is not None:
             handle.cancel()
@@ -626,7 +636,8 @@ class PullBoard:
         self.panel.set_pulls([])
         if source is not None:
             self.panel.set_reading(source)
-        if self.active() and (not same_log or self.loads.selected not in self.loads.cache):
+        displayed = self.ctl.displayed_key("local", self.loads.cache)
+        if self.active() and (not same_log or displayed not in self.loads.cache):
             self.ctl.clear_session()
         return self.gen
 
@@ -677,7 +688,8 @@ class PullBoard:
         self.panel.set_selected(index)
         if action == "show":
             if self.active():
-                self.ctl.set_session(self.loads.cache[key])
+                cached = self.loads.cache[key]
+                self.ctl.show_session(cached, origin=("local", key))
         elif action == "start":
             self.panel.show_progress(index, 0.0)
             self._make_room()
@@ -708,7 +720,7 @@ class PullBoard:
             return False
         self.panel.mark_done(self._index[key])
         if show:
-            self.ctl.set_session(session)
+            self.ctl.set_session(session, origin=("local", key))
         self.trim_to_limit(keep=key)
         return show
 
@@ -717,9 +729,10 @@ class PullBoard:
         if not 0 <= index < len(self.keys):
             return
         key = self.keys[index]
+        displayed = self.ctl.displayed_key("local", self.loads.cache)
+        self.loads.cache.pop(key, None)
         self.loads.abandon(key)
-        session = self.loads.cache.pop(key, None)
-        if session is not None and self.ctl.session is session:
+        if displayed == key:
             self.ctl.clear_session()
         if self.loads.selected == key:
             self.loads.selected = None
@@ -755,9 +768,10 @@ class PullBoard:
         return False
 
     def _forget(self, key: tuple, index: int | None) -> None:
-        session = self.loads.cache.pop(key, None)
+        displayed = self.ctl.displayed_key("local", self.loads.cache)
+        self.loads.cache.pop(key, None)
         self.loads.forget_order(key)
-        if session is not None and self.ctl.session is session:
+        if displayed == key:
             self.ctl.clear_session()
         if self.loads.selected == key and key not in self.loads.running:
             self.loads.selected = None
@@ -767,6 +781,7 @@ class PullBoard:
 
     def clear_cache(self) -> None:
         """Drop finished results. A pinned pull, and one that is still computing, stay."""
+        displayed = self.ctl.displayed_key("local", self.loads.cache)
         self.loads.cache = {key: session for key, session in self.loads.cache.items() if key in self.pinned}
         self.loads.order = [
             key for key in self.loads.order if key in self.loads.running or key in self.loads.cache
@@ -775,8 +790,8 @@ class PullBoard:
             if self.loads.selected not in self.loads.running:
                 self.loads.selected = None
                 self.panel.set_selected(None)
-            if self.active():
-                self.ctl.clear_session()
+        if self.active() and displayed is not None and displayed not in self.loads.cache:
+            self.ctl.clear_session()
         for index, key in enumerate(self.keys):
             if key not in self.loads.running and key not in self.loads.cache:
                 self.panel.clear_done(index)
@@ -795,6 +810,7 @@ class PullBoard:
         def gone(key: tuple) -> bool:
             return len(key) >= 2 and key[0] == "local" and key[1] == path and key not in self._index
 
+        displayed = self.ctl.displayed_key("local", self.loads.cache)
         for key in [key for key in self.loads.cache if gone(key)]:
             del self.loads.cache[key]
         for key in [key for key in self.loads.running if gone(key)]:
@@ -803,6 +819,8 @@ class PullBoard:
         if any(gone(key) for key in self.pinned):
             self.pinned = {key for key in self.pinned if not gone(key)}
             self._save_pins()
+        if self.active() and displayed is not None and gone(displayed):
+            self.ctl.clear_session()
 
     def _migrate_legacy_pins(self) -> None:
         """Keep old range-only favorites, attaching the current fingerprint on first refresh."""
@@ -832,10 +850,11 @@ class PullBoard:
         if selected not in self._index:
             if selected is not None or self.ctl.session is not None:
                 self.loads.selected = None
-                if self.active():
+                displayed = self.ctl.displayed_key("local", self.loads.cache)
+                if self.active() and displayed not in self._index:
                     self.ctl.clear_session()
             return
         self.panel.set_selected(self._index[selected])
         cached = self.loads.cache.get(selected)
-        if self.active() and cached is not None and self.ctl.session is not cached:
-            self.ctl.set_session(cached)
+        if self.active() and cached is not None:
+            self.ctl.show_session(cached, origin=("local", selected))

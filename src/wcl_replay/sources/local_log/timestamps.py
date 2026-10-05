@@ -5,18 +5,20 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date
 from functools import lru_cache
+
+_EPOCH_ORDINAL = date(1970, 1, 1).toordinal()
 
 
 @lru_cache(maxsize=64)
 def _day_ms(date_part: str) -> int:
     month, day, year = date_part.split("/")
-    return int(datetime(int(year), int(month), int(day)).timestamp() * 1000)
+    return (date(int(year), int(month), int(day)).toordinal() - _EPOCH_ORDINAL) * 86400_000
 
 
 def parse_ts_ms(ts: str) -> int:
-    """Absolute milliseconds (local time epoch) of a combat log timestamp."""
+    """Milliseconds on a wall-clock timeline independent of the machine's time zone."""
     date_part, _, time_part = ts.partition(" ")
     hh, mm, rest = time_part.split(":")
     sec, _, frac = rest.partition(".")

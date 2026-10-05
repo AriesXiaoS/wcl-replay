@@ -278,8 +278,15 @@ class P2Model:
                             tank = x.dst
                         elif a and a.npc_id == C.NPC_GHOST:
                             severed += 1
-                    elif x.spell_id == C.SOUL_SEVER and x.type == "SPELL_DAMAGE" and tank < 0:
+                    elif (
+                        x.spell_id == C.SOUL_SEVER
+                        and x.type in ("SPELL_DAMAGE", "SPELL_MISSED", "SPELL_ABSORBED")
+                        and tank < 0
+                        and self._is_player(x.dst)
+                    ):
                         tank = x.dst
+                if tank < 0:
+                    tank = self._melee_target(e.t)
                 out.append((start if start is not None else e.t - 4000, e.t, tank, severed))
                 start = None
         return out
@@ -295,6 +302,19 @@ class P2Model:
             return None
         active.sort(key=lambda row: (t < row[0], abs(row[1] - t)))
         return active[0][2]
+
+    def _is_player(self, aid: int) -> bool:
+        actor = self.data.actors.get(aid)
+        return actor is not None and actor.is_player
+
+    def _melee_target(self, t: int) -> int:
+        found = -1
+        for e in self.data.events:
+            if e.t > t:
+                break
+            if e.src == self.boss and e.type in ("SWING_DAMAGE", "SWING_MISSED") and self._is_player(e.dst):
+                found = e.dst
+        return found
 
     def _fixate_ends(self) -> list[FixateEnd]:
         sever_ts = [t for _s, t, _tank, _n in self.soul_severs]
@@ -419,6 +439,9 @@ class P2Model:
                     lst = samples[g.aid]
                     if not lst or lst[-1].t < ts:
                         lst.append(Sample(ts, x, y, 0.0, 1, 1))
+                    elif lst[-1].t == ts:
+                        # Source records keep their order when sub-millisecond times collapse.
+                        lst[-1] = Sample(ts, x, y, 0.0, 1, 1)
                     i += 1
                     anchored = True
                 log_i[g.aid] = i
@@ -491,13 +514,21 @@ class P2Model:
                 groups[-1].targets.append(iv.actor)
             else:
                 groups.append(Bomb(iv.end, [iv.actor]))
-        for b in groups:
+        # Windows may overlap even when the bombs form separate groups. Assign each logged
+        # removal once, to the closest eligible explosion (the earlier group breaks a tie).
+        owners: dict[int, tuple[int, int]] = {}
+        for index, b in enumerate(groups):
             for e in events_between(self.data, self.times, b.t - 20, b.t + 200):
                 if e.spell_id == C.SOUL_SHIELD and e.type in (
                     "SPELL_AURA_REMOVED_DOSE",
                     "SPELL_AURA_REMOVED",
                 ):
-                    b.cracked += 1
+                    candidate = (abs(e.t - b.t), index)
+                    previous = owners.get(id(e))
+                    if previous is None or candidate < previous:
+                        owners[id(e)] = candidate
+        for _distance, index in owners.values():
+            groups[index].cracked += 1
         return groups
 
     def _tongue_windows(self) -> dict[int, list[tuple[int, int]]]:
@@ -513,22 +544,21 @@ class P2Model:
     def _wails(self) -> list[WailCast]:
         coil = set(self.soulcoilers)
         starts = [
-            e
-            for e in self.data.events
+            (index, e)
+            for index, e in enumerate(self.data.events)
             if e.type == "SPELL_CAST_START" and e.spell_id == C.WAIL and e.src in coil
         ]
         out = []
-        seen: set[tuple[int, int]] = set()
         # Cursed bar, plus a little room for damage pushback. The next cast start still ends the search.
         span = int(self.wail_cast_ms * C.TONGUES_CAST_MULT) + 4000
-        for s in starts:
-            if (s.src, s.t) in seen:
-                continue
-            seen.add((s.src, s.t))
+        for start_index, s in starts:
             limit = s.t + span
             end, outcome, kicker, feared = min(limit, self.end_t), "unknown", -1, 0
-            died = self.tracks.death_time(s.src)
-            for e in events_between(self.data, self.times, s.t + 1, limit):
+            # Event positions distinguish an immediate result from an earlier same-ms record.
+            for index in range(start_index + 1, len(self.data.events)):
+                e = self.data.events[index]
+                if e.t > limit:
+                    break
                 if e.type == "SPELL_INTERRUPT" and e.dst == s.src and e.extra == C.WAIL:
                     end, outcome, kicker = e.t, "kicked", e.src
                     break
@@ -552,8 +582,8 @@ class P2Model:
                 if e.type == "SPELL_CAST_START" and e.src == s.src and e.spell_id == C.WAIL:
                     end = e.t
                     break
-                if died is not None and e.t >= died:
-                    end, outcome = died, "died"
+                if e.type == "UNIT_DIED" and e.dst == s.src:
+                    end, outcome = e.t, "died"
                     break
             out.append(WailCast(s.src, s.t, end, outcome, kicker, feared))
         return out
@@ -729,8 +759,10 @@ class P2Model:
         out: list[Prim] = []
         for cs, st, tank, _n in self.soul_severs:
             if st - C.SEVER_PREVIEW_MS <= t <= st + 600 and tank >= 0:
-                bp = self.tracks.position(self.boss, t)
-                tp = self.tracks.position(tank, t)
+                # Follow the preview, then retain the positions at impact while its residue shows.
+                at = min(t, st)
+                bp = self.tracks.position(self.boss, at)
+                tp = self.tracks.position(tank, at)
                 if bp and tp:
                     casting = t >= cs
                     out.append(

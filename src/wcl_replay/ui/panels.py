@@ -60,22 +60,30 @@ class StatusPanel(QTextBrowser):
         super().__init__(parent)
         self.ctl = ctl
         self.setOpenLinks(False)
+        self._html: str | None = None
+        self._rendered_t: float | None = None
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(120)
         self._timer.timeout.connect(self._render)
-        ctl.timeChanged.connect(lambda _t: self._timer.start() if not self._timer.isActive() else None)
+        ctl.timeChanged.connect(self._on_time)
         ctl.sessionChanged.connect(self._render)
-        ctl.analysisChanged.connect(self._render)
-        ctl.layersChanged.connect(self._render)
+        ctl.analysisChanged.connect(self._schedule_render)
+        ctl.layersChanged.connect(self._schedule_render)
+
+    def _on_time(self, t: float) -> None:
+        if t != self._rendered_t and not self._timer.isActive():
+            self._timer.start(120)
+
+    def _schedule_render(self) -> None:
+        # Parameter changes emit analysis, layers and time together; paint their final state once.
+        self._timer.start(0)
 
     def _render(self) -> None:
+        self._timer.stop()
         s = self.ctl.session
         parts = [f'<p style="color:{theme.TEXT_DIM}; font-weight:bold;">RIGHT NOW</p>']
-        if s is None:
-            self.setHtml("".join(parts))
-            return
-        for sec in s.analysis.status_at(self.ctl.t):
+        for sec in s.analysis.status_at(self.ctl.t) if s is not None else ():
             parts.append(
                 f'<p style="color:{sec.color}; font-weight:bold; margin-top:8px;">{html.escape(sec.title)}</p>'
             )
@@ -86,8 +94,13 @@ class StatusPanel(QTextBrowser):
                 parts.append("</table>")
             if sec.note:
                 parts.append(f'<p style="color:{theme.TEXT_DIM};">{html.escape(sec.note)}</p>')
+        text = "".join(parts)
+        self._rendered_t = self.ctl.t
+        if text == self._html:
+            return
+        self._html = text
         sb = self.verticalScrollBar().value()
-        self.setHtml("".join(parts))
+        self.setHtml(text)
         self.verticalScrollBar().setValue(sb)
 
 
@@ -107,15 +120,23 @@ class EventLogPanel(QTextBrowser):
         self._table: QTextTable | None = None
         self._future_marks: list[QTextEdit.ExtraSelection] = []
         self._inline_backgrounds: list[list[QTextEdit.ExtraSelection]] = []
+        self._log_lanes: tuple[str, ...] = ()
+        self._lane_state: tuple[bool, ...] = ()
         ctl.sessionChanged.connect(self._on_session)
         ctl.analysisChanged.connect(self._on_session)
         ctl.timeChanged.connect(lambda _t: self._render())
-        ctl.layersChanged.connect(lambda: self._render(force=True))
+        ctl.layersChanged.connect(self._on_layers)
 
     def _on_session(self) -> None:
         s = self.ctl.session
         self._times = [e.t for e in s.analysis.log] if s else []
+        self._log_lanes = tuple(sorted({e.lane for e in s.analysis.log if e.lane})) if s else ()
         self._render(force=True)
+
+    def _on_layers(self) -> None:
+        state = tuple(self.ctl.layer_on(lane) for lane in self._log_lanes)
+        if state != self._lane_state:
+            self._render(force=True)
 
     def _on_anchor(self, url: QUrl) -> None:
         text = url.toString()
@@ -130,6 +151,7 @@ class EventLogPanel(QTextBrowser):
             self._table = None
             self._future_marks = []
             self._inline_backgrounds = []
+            self._lane_state = ()
             self.setExtraSelections([])
             if force or not self.document().isEmpty():
                 self.setHtml("")
@@ -152,6 +174,7 @@ class EventLogPanel(QTextBrowser):
     def _build_log(self) -> None:
         """Build rich text only when its content or lane filtering changes."""
         s = self.ctl.session
+        self._lane_state = tuple(self.ctl.layer_on(lane) for lane in self._log_lanes)
         parts = [
             f'<p style="color:{theme.TEXT_DIM}; font-weight:bold;">WHAT HAPPENED · 点击跳转</p>',
             '<table width="100%" cellspacing="0" cellpadding="3">',
